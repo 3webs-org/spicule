@@ -254,7 +254,7 @@ static void test_setid_family(void)
 	 * match either, and uid 0 is not the real user ID (1000) -- the
 	 * clause's precondition holds exactly.
 	 *
-	 * Mechanism: src/unistd/ids.c:12-19 are six one-line
+	 * Mechanism: src/unistd/ids.c:62-67 are six one-line
 	 *     int setuid(uid_t u) { (void)u; return 0; }
 	 * stubs.  The argument is cast to void and 0 is returned
 	 * unconditionally.  Probed on this tree: setuid(0), seteuid(0),
@@ -347,19 +347,6 @@ static void test_process_group_and_session(void)
 	CHECK(setpgid(0, getpgrp()) == 0);
 	CHECK(setpgid(self, getpgrp()) == 0);
 
-	/* setpgrp.html RETURN VALUE: "Upon completion, setpgrp() shall
-	 * return the process group ID."  ERRORS: "No errors are defined."
-	 * -- so whatever it returns must be the same number getpgrp()
-	 * reports afterwards. */
-	errno = 0;
-	CHECK(setpgrp() == getpgrp());
-	CHECK(errno == 0);
-
-	/* setsid.html RETURN VALUE: "the value of the new process group ID
-	 * of the calling process" -- so it must agree with the getters. */
-	CHECK(setsid() == getpgrp());
-	CHECK(getsid(0) == getpgrp());
-
 	/* getpgid.html ERRORS: "The getpgid() function *shall* fail if:
 	 * ... [ESRCH] There is no process with a process ID equal to
 	 * pid."  getsid.html carries the identical shall-fail clause.
@@ -399,13 +386,17 @@ static void test_process_group_and_session(void)
 	 *    process ID of the calling process or of a child process of
 	 *    the calling process."
 	 *
-	 * Mechanism: src/unistd/ids.c:22 is
+	 * Mechanism: src/unistd/ids.c:77 is
 	 *     int setpgid(pid_t a, pid_t b) { (void)a; (void)b; return 0; }
-	 * -- neither argument is looked at.  The [EINVAL] half is a pure
-	 * range check on a signed value and needs no process-group model
-	 * whatsoever; the [ESRCH] half needs the same child lookup the
-	 * getpgid fence above describes.  Probed on this tree:
-	 * setpgid(0, -1) and setpgid(999999, 0) both return 0.
+	 * -- neither argument is looked at, and it is the one member of
+	 * the family that stayed a stub when the rest gained real
+	 * process-group state: the only request it can grant is the one
+	 * this test makes, joining the group the caller is already in.
+	 * The [EINVAL] half is a pure range check on a signed value and
+	 * needs no process-group model whatsoever; the [ESRCH] half needs
+	 * the same child lookup the getpgid fence above describes.
+	 * Probed on this tree: setpgid(0, -1) and setpgid(999999, 0) both
+	 * return 0.
 	 * Re-enable when setpgid() validates its arguments. */
 	errno = 0;
 	CHECK(setpgid(0, -1) == -1 && errno == EINVAL);
@@ -413,68 +404,71 @@ static void test_process_group_and_session(void)
 	CHECK(setpgid(999999, 0) == -1 && errno == ESRCH);
 #endif
 
-#if NTLIBC_TEST(BUG, posix_ids_setsid_second_call_eperm) /* BUG (compiles and links; formerly UNIMPL):: setsid() cannot report [EPERM], because this platform
-	 * has no state in which the clause's precondition could become
-	 * true and no state it could move to if it did.
-	 *
-	 * setsid.html DESCRIPTION: "The setsid() function shall create a
+	/* setsid.html DESCRIPTION: "The setsid() function shall create a
 	 * new session, if the calling process is not a process group
 	 * leader.  Upon return the calling process shall be the session
 	 * leader of this new session ... The process group ID of the
 	 * calling process shall be set equal to the process ID of the
-	 * calling process."  ERRORS: "[EPERM] The calling process is
-	 * already a process group leader".
+	 * calling process."  RETURN VALUE: "the value of the new process
+	 * group ID of the calling process."  ERRORS: "[EPERM] The calling
+	 * process is already a process group leader".
 	 *
-	 * Read together, those two make a state machine with a testable
-	 * transition: the first setsid() succeeds and leaves the process a
-	 * group leader (pgid == pid), so the *second* must fail with
-	 * [EPERM].  src/unistd/ids.c:24 is `pid_t setsid(void) { return 1; }`
-	 * -- it always answers 1, never sets the process group ID to
-	 * getpid(), and so never enters the state that would make the
-	 * second call fail.  Probed: setsid() twice, both return 1, and
-	 * getpgrp() is 1 while getpid() is not.
+	 * Read together those make a state machine with one transition,
+	 * and this is the whole of it: a process is born into a group it
+	 * does not lead -- src/unistd/ids.c starts the process group id at
+	 * 1, a number no pid can be, so `pgid == getpid()` is false at
+	 * startup by construction -- so the first call succeeds and leaves
+	 * pgid == pid, and the second must fail.
 	 *
-	 * UNIMPL rather than N/A, and rather than BUG: N/A would need NT
-	 * to have no way to express "this process leads its own group",
-	 * but the whole model here is a *chosen* fiction of one fixed
-	 * session (src/unistd/ids.c's banner, src/termios/termios.c's) --
-	 * "I chose not to" is UNIMPL by this project's own rule.  BUG
-	 * would overstate it: unlike the set*id fences above there is no
-	 * single call whose answer is a lie in isolation, only a
-	 * transition that never happens.  Re-enable if session state is
-	 * ever modelled. */
+	 * This runs before the self-consistency checks below rather than
+	 * after them for that reason: the transition can be spent only
+	 * once per process, and setpgrp() first would spend it, its one
+	 * specified effect being to make the caller a group leader, which
+	 * is precisely [EPERM]'s precondition.  (setpgrp()'s *effect* is
+	 * therefore asserted from the other end, in test/posix-unistd.c's
+	 * test_id_session_stubs, whose process has not been made a session
+	 * leader by the time it gets there.) */
 	CHECK(setsid() == getpid());
 	CHECK(getpgrp() == getpid());
+	CHECK(getsid(0) == getpgrp());
 	errno = 0;
 	CHECK(setsid() == (pid_t)-1 && errno == EPERM);
-#endif
+	/* ... and a call that failed changed nothing. */
+	CHECK(getpgrp() == getpid() && getsid(0) == getpid());
 
-#if NTLIBC_TEST(BUG, posix_ids_setpgrp_sets_process_group) /* BUG (compiles and links; formerly UNIMPL):: setpgrp() does not set the process group ID to the
-	 * process ID.  setpgrp.html DESCRIPTION: "If the calling process
-	 * is not already a session leader, setpgrp() sets the process
-	 * group ID of the calling process to the process ID of the calling
-	 * process."  ERRORS: "No errors are defined", so unlike setsid()
-	 * there is not even a failure return to hide behind -- the call
-	 * has exactly one specified effect and it does not happen.
-	 * src/unistd/ids.c:23 is `pid_t setpgrp(void) { return 1; }`.
-	 * Same UNIMPL reasoning as the setsid() fence above; the
-	 * self-consistency that *is* checkable (setpgrp() == getpgrp())
-	 * is asserted unfenced above. */
+	/* setpgrp.html DESCRIPTION: "If the calling process is not already
+	 * a session leader, setpgrp() sets the process group ID of the
+	 * calling process to the process ID of the calling process."
+	 * RETURN VALUE: "Upon completion, setpgrp() shall return the
+	 * process group ID."  ERRORS: "No errors are defined."
+	 *
+	 * The setsid() above made this process a session leader, so the
+	 * conditional effect is a no-op here and what is left to check is
+	 * the return: the process group ID -- which that same setsid() has
+	 * made equal to the process ID -- and that it is the same number
+	 * getpgrp() reports afterwards, with errno untouched. */
+	errno = 0;
 	CHECK(setpgrp() == getpid());
-#endif
+	CHECK(setpgrp() == getpgrp());
+	CHECK(errno == 0);
 
 	/* N/A, with the mechanism: setpgid()'s [EACCES] ("the child
 	 * process has successfully executed one of the exec functions")
 	 * and its two remaining [EPERM] clauses, and the [EPERM] clauses
 	 * of getpgid()/getsid() ("not in the same session as the calling
 	 * process").  All four presuppose a second process in a
-	 * *different* session or process group from the caller.  This
-	 * platform has exactly one session and one process group, fixed at
-	 * 1 for every process (src/unistd/ids.c), and NT has no session or
-	 * process-group object for src/process/spawn.c to put a child into
-	 * a different one of -- a Job object is the nearest NT construct
-	 * and it is not a process group: it has no leader, no session, and
-	 * no relationship to a controlling terminal.  So the *precondition*
+	 * *different* session or process group from the caller, and that a
+	 * process can *name* it.  Neither is constructible.  The group and
+	 * session ids src/unistd/ids.c keeps are per-process bookkeeping
+	 * with no registry behind them -- nothing there can report another
+	 * process's group or session (getpgid()/getsid() ignore their pid,
+	 * the fence above) -- and NT has no session or process-group object
+	 * for src/process/spawn.c to put a child into a different one of:
+	 * a console process group is the nearest construct and cannot be
+	 * joined (src/process/posix_spawn.c's banner).  Making setsid()
+	 * real did not change that; it added a transition the *caller* can
+	 * observe about itself, which is a different thing from a second
+	 * process to compare against.  So the *precondition*
 	 * of each of those clauses is unconstructible rather than merely
 	 * unimplemented, which is what separates them from the [ESRCH] and
 	 * [EINVAL] fences above -- those need only a pid range check. */
@@ -553,7 +547,7 @@ static void test_chown_family(void)
 	 * is not an absolute path and fd is a file descriptor associated
 	 * with a non-directory file."
 	 *
-	 * Mechanism: src/unistd/ids.c:26-29 are four one-line stubs that
+	 * Mechanism: src/unistd/ids.c:128-131 are four one-line stubs that
 	 * cast every argument to void and return 0.  Not one of them
 	 * touches __ntpath_at() or __fd_get(), which is how every other
 	 * path- or fd-taking call in the library produces these errnos.
