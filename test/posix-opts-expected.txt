@@ -10,7 +10,7 @@
 # kernel32 disabled. These rules deliberately make no claim about another
 # profile; add measured profile rules rather than copying these blindly.
 #
-# COUNTS PASS=406 BUG=179 UNIMPL=977 NA=44 FLAKY=4
+# COUNTS PASS=406 BUG=177 UNIMPL=977 NA=46 FLAKY=4
 aio_cancel/1-1.c	runtime=wine,target_arch=x86_64,kernel32=no	UNIMPL	OPTS class A: compile/link blocked by aio.h
 aio_cancel/10-1.c	runtime=wine,target_arch=x86_64,kernel32=no	UNIMPL	OPTS class A: compile/link blocked by aio.h
 aio_cancel/2-1.c	runtime=wine,target_arch=x86_64,kernel32=no	UNIMPL	OPTS class A: compile/link blocked by aio.h
@@ -148,8 +148,8 @@ gmtime/2-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	-
 kill/1-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	-
 kill/1-2.c	runtime=wine,target_arch=x86_64,kernel32=no	BUG	baseline compiled and failed (FAIL)
 kill/2-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	-
-kill/2-2.c	runtime=wine,target_arch=x86_64,kernel32=no	BUG	baseline compiled and failed (FAIL)
-kill/3-1.c	runtime=wine,target_arch=x86_64,kernel32=no	BUG	baseline compiled and failed (FAIL)
+kill/2-2.c	runtime=wine,target_arch=x86_64,kernel32=no	NA	suite outcome UNRESOLVED: the case setuid(1)s to drop privilege and returns PTS_UNRESOLVED when that fails, which it now does (one identity, no privilege to drop)
+kill/3-1.c	runtime=wine,target_arch=x86_64,kernel32=no	NA	suite outcome UNRESOLVED: the case setuid(1)s to drop privilege and returns PTS_UNRESOLVED when that fails, which it now does (one identity, no privilege to drop)
 killpg/1-1.c	runtime=wine,target_arch=x86_64,kernel32=no	NA	baseline suite outcome UNRESOLVED
 killpg/1-2.c	runtime=wine,target_arch=x86_64,kernel32=no	UNIMPL	OPTS class B: compile/link blocked
 killpg/2-1.c	runtime=wine,target_arch=x86_64,kernel32=no	BUG	baseline compiled and failed (FAIL)
