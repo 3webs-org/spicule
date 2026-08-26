@@ -32,6 +32,20 @@ int __putenv(char *s, size_t l, char *owned);
 PTEB __teb(void);                            /* this thread's TEB */
 #define __process_heap() (__peb->ProcessHeap)
 
+/* ---- NT kernel version ------------------------------------------------- *
+ * Read src/internal/ntversion.c's banner before using either of these.
+ * Version-gating is a last resort in this library, reserved for wire
+ * formats that changed between NT releases, carry no discriminator, and
+ * *succeed* when handed the wrong layout -- which is the one case a
+ * capability probe cannot cover.  Everything else probes.
+ *
+ * These report the kernel's version (PEB.OSMajorVersion/OSMinorVersion),
+ * which is unrelated to, and never a statement about, ntlibc's minimum
+ * supported Windows version, which is set by the ntdll imports in
+ * tools/ntdll.def. */
+int __nt_os_version(unsigned *major, unsigned *minor); /* 1 if measured, 0 if assumed */
+int __nt_version_at_least(unsigned major, unsigned minor);
+
 /* ---- errno ------------------------------------------------------------- */
 int __errno_from_status(NTSTATUS);           /* map, do not set */
 int __set_errno_status(NTSTATUS);            /* errno = map(st); return -1 */
