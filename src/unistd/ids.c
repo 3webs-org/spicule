@@ -112,7 +112,11 @@ int chown(const char *p, uid_t u, gid_t g) { (void)p; (void)u; (void)g; return 0
 int fchown(int f, uid_t u, gid_t g) { (void)f; (void)u; (void)g; return 0; }
 int lchown(const char *p, uid_t u, gid_t g) { (void)p; (void)u; (void)g; return 0; }
 int fchownat(int d, const char *p, uid_t u, gid_t g, int f) { (void)d; (void)p; (void)u; (void)g; (void)f; return 0; }
-int nice(int n) { (void)n; return 0; }
+/* nice() used to be `(void)incr; return 0;` here, among identity calls it
+ * has nothing to do with.  It moved to src/misc/resource.c, beside the
+ * one piece of state getpriority()/setpriority() already keep this
+ * process's nice value in, so that the two interfaces cannot disagree
+ * about it. */
 int chroot(const char *p) { (void)p; errno = EPERM; return -1; }
 int issetugid(void) { return 0; }
 char *getlogin(void)
