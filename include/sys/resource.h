@@ -99,7 +99,8 @@ int getrusage (int, struct rusage *);
  *
  * PRIO_PGRP/PRIO_USER: ntlibc models exactly one process group (this
  * process is always its own and only member -- getpgrp() is a hardcoded
- * 1) and exactly one user (geteuid() is a hardcoded 1000), so who==0,
+ * 1) and exactly one current user (geteuid() maps the process token), so
+ * who==0,
  * who==getpgrp(), or who==geteuid() all honestly denote "this process,
  * the sole member of its own group and the sole process running as this
  * uid" and behave exactly like PRIO_PROCESS on self. Any other who value
