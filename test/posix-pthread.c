@@ -207,7 +207,7 @@ static void test_pthread_attr_roundtrip(void)
  * pthread_mutex_init.html, pthread_mutexattr_settype.html
  * ================================================================== */
 
-#if NTLIBC_TEST(UNIMPL, posix_pthread_mutex_lock_unlock)
+#if NTLIBC_TEST(PASS, posix_pthread_mutex_lock_unlock)
 #include <pthread.h>
 #include <errno.h>
 
@@ -247,7 +247,7 @@ static void test_pthread_mutex_lock_unlock(void)
 }
 #endif
 
-#if NTLIBC_TEST(UNIMPL, posix_pthread_mutexattr_type_relock)
+#if NTLIBC_TEST(PASS, posix_pthread_mutexattr_type_relock)
 #include <pthread.h>
 #include <errno.h>
 
