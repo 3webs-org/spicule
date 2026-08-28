@@ -173,9 +173,11 @@ static int take_pending_from_set(const sigset_t *set, siginfo_t *si)
  * from spuriously interrupting another thread's semaphore wait. */
 static unsigned long caught_count;
 static __thread unsigned long thread_caught_count;
+static __thread unsigned long thread_restart_count;
 
 unsigned long __sig_caught_count(void) { return caught_count; }
 unsigned long __sig_thread_caught_count(void) { return thread_caught_count; }
+unsigned long __sig_thread_restart_count(void) { return thread_restart_count; }
 
 /* sigaction.html, SA_NOCLDWAIT: "If ... set for SIGCHLD ... and the
  * calling process subsequently forks, ... the behavior is unspecified
@@ -448,6 +450,7 @@ int __raise_internal_info(int sig, const void *data)
 		 * interrupted still has to see that it did. */
 		caught_count++;
 		thread_caught_count++;
+		if (flags & SA_RESTART) thread_restart_count++;
 
 		/* sigaction.html DESCRIPTION: "If SA_SIGINFO is set ...
 		 * sa_sigaction ... specif[ies] a signal-catching function" that
@@ -469,6 +472,16 @@ int __raise_internal_info(int sig, const void *data)
 		}
 
 		blocked = saved;
+		/* raise() and pthread_kill() are thread-directed.  If the handler
+		 * deferred one of those signals, restoring its entry mask is the
+		 * point at which the newly-unblocked pending signal is delivered. */
+		for (i = 1; i < _NSIG; i++) {
+			if (sigismember(&thread_pending, i) &&
+			    !sigismember(&blocked, i)) {
+				sigdelset(&thread_pending, i);
+				__raise_internal(i);
+			}
+		}
 	}
 	return 0;
 }
@@ -498,7 +511,7 @@ int __raise_thread_internal(int sig)
 	return __raise_internal(sig);
 }
 
-int raise(int sig) { int r; __sig_lock(); r = __raise_internal(sig); __sig_unlock(); return r < 0 ? -1 : 0; }
+int raise(int sig) { int r; __sig_lock(); r = __raise_thread_internal(sig); __sig_unlock(); return r < 0 ? -1 : 0; }
 
 /* The signals whose default action is "stop the process" -- action S in
  * signal.h.html's Default Action column: SIGSTOP, and the three
