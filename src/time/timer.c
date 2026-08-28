@@ -11,6 +11,7 @@
  */
 #include <time.h>
 #include <signal.h>
+#include <sys/time.h>
 #include <limits.h>
 #include <string.h>
 #include <errno.h>
@@ -28,6 +29,7 @@ struct posix_timer {
 
 static struct posix_timer timers[TIMER_MAX];
 static int manager_started;
+static timer_t interval_timers[3];
 
 static int clock_supported(clockid_t clock)
 {
@@ -253,5 +255,87 @@ int timer_delete(timer_t id)
 void __timer_reinit_after_fork(void)
 {
 	memset(timers, 0, sizeof timers);
+	memset(interval_timers, 0, sizeof interval_timers);
 	manager_started = 0;
+}
+
+static int timeval_valid(const struct timeval *value)
+{
+	return value->tv_sec >= 0 && value->tv_usec >= 0 &&
+	       value->tv_usec < 1000000L;
+}
+
+static void timeval_timespec(const struct timeval *from, struct timespec *to)
+{
+	to->tv_sec = from->tv_sec;
+	to->tv_nsec = from->tv_usec * 1000L;
+}
+
+static void timespec_timeval(const struct timespec *from, struct timeval *to)
+{
+	to->tv_sec = from->tv_sec;
+	to->tv_usec = from->tv_nsec / 1000L;
+}
+
+int getitimer(int which, struct itimerval *value)
+{
+	struct itimerspec current;
+	int result = 0;
+
+	if (which < ITIMER_REAL || which > ITIMER_PROF) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (!value) { errno = EFAULT; return -1; }
+	__sig_lock();
+	if (!interval_timers[which]) memset(&current, 0, sizeof current);
+	else result = timer_gettime(interval_timers[which], &current);
+	if (!result) {
+		timespec_timeval(&current.it_value, &value->it_value);
+		timespec_timeval(&current.it_interval, &value->it_interval);
+	}
+	__sig_unlock();
+	return result;
+}
+
+int setitimer(int which, const struct itimerval *__restrict value,
+	struct itimerval *__restrict old)
+{
+	static const clockid_t clocks[3] = {
+		CLOCK_REALTIME, CLOCK_PROCESS_CPUTIME_ID, CLOCK_PROCESS_CPUTIME_ID
+	};
+	static const int signals[3] = { SIGALRM, SIGVTALRM, SIGPROF };
+	struct sigevent event;
+	struct itimerspec setting;
+	timer_t created = 0;
+	int result = 0;
+
+	if (which < ITIMER_REAL || which > ITIMER_PROF || !value ||
+	    !timeval_valid(&value->it_value) ||
+	    !timeval_valid(&value->it_interval)) {
+		errno = !value ? EFAULT : EINVAL;
+		return -1;
+	}
+	__sig_lock();
+	if (old && getitimer(which, old) < 0) result = -1;
+	if (!result && !interval_timers[which] &&
+	    (value->it_value.tv_sec || value->it_value.tv_usec ||
+	     value->it_interval.tv_sec || value->it_interval.tv_usec)) {
+		memset(&event, 0, sizeof event);
+		event.sigev_notify = SIGEV_SIGNAL;
+		event.sigev_signo = signals[which];
+		if (timer_create(clocks[which], &event, &created) < 0) result = -1;
+		else interval_timers[which] = created;
+	}
+	if (!result && interval_timers[which]) {
+		timeval_timespec(&value->it_value, &setting.it_value);
+		timeval_timespec(&value->it_interval, &setting.it_interval);
+		result = timer_settime(interval_timers[which], 0, &setting, 0);
+	}
+	if (result && created) {
+		timer_delete(created);
+		interval_timers[which] = 0;
+	}
+	__sig_unlock();
+	return result;
 }
