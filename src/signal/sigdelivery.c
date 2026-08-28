@@ -13,9 +13,9 @@
  * owns a named pipe (\Device\NamedPipe\ntlibc-sig.<pid>) and one
  * dedicated OS thread blocked reading it; kill() to another ntlibc
  * process writes a small packet to *its* pipe instead of guessing, and
- * that process's own delivery thread turns the packet into exactly the
- * same __raise_internal() call raise()/kill(getpid(),...) already make,
- * so sigprocmask()'s blocked/pending bookkeeping applies for free.
+ * that process's own delivery thread queues the packet process-wide.
+ * An eligible application thread drains it at a signal-aware safe point,
+ * so that thread's sigprocmask() state controls blocked/pending delivery.
  *
  * What this deliberately does NOT do -- thread-context hijacking
  * (SuspendThread/GetThreadContext/SetThreadContext + instruction-pointer
@@ -91,10 +91,9 @@
  * threading support to speak of" -- sigwait()'s banner already
  * documents one narrow exception (the NTLIBC_USE_KERNEL32 console-
  * control handler thread), unguarded. This file adds a second, ordinary
- * one: sig_delivery_thread() calls __raise_internal() concurrently with
- * whatever the application thread is doing, and both sides read and
- * write signal.c's shared handlers[]/act_mask[]/act_flags[]/blocked/
- * pending/alt_stack/alt_active. __sig_lock()/__sig_unlock() below are a
+ * one: sig_delivery_thread() queues pending state concurrently with
+ * whatever the application thread is doing. __sig_lock()/__sig_unlock()
+ * below are a
  * RECURSIVE mutex built from a SynchronizationEvent (auto-reset: the
  * first waiter to see it signalled is the only one released, the "P"/"V"
  * a binary semaphore needs) plus an owning-thread id and a re-entry
@@ -310,7 +309,11 @@ static ULONG NTAPI sig_delivery_thread(PVOID arg)
 				si.si_pid = (pid_t)pkt.sender_pid;
 				si.si_uid = (uid_t)pkt.sender_uid;
 				si.si_value = pkt.value;
-				__raise_internal_info((int)pkt.signo, &si);
+				/* The service thread is not a POSIX application thread and
+				 * must never make a process-directed signal eligible merely
+				 * because its own TLS mask is empty.  Queue it process-wide;
+				 * an application safe point drains it on an eligible thread. */
+				__sig_queue_process_info((int)pkt.signo, &si);
 				__sig_unlock();
 			}
 		}

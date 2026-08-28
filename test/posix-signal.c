@@ -10,12 +10,8 @@
  * read those first; this file does not repeat what they already assert.
  *
  * src/signal/signal.c's header comment is required reading before any of
- * this: there is no asynchronous signal delivery from another thread or
- * process on this platform. Signals are self-generated, synchronous CPU
- * exceptions, or packets handled by ntlibc's delivery thread. Clauses that
- * only make sense with asynchronous mask replacement (a real
- * sigsuspend() that blocks) are marked N/A with
- * the reason below rather than given a test that could never pass.
+ * this. Signals are self-generated, synchronous CPU exceptions, or packets
+ * queued by ntlibc's delivery thread and drained at signal-aware safe points.
  */
 #include "test-policy.h"
 #include <stdio.h>
@@ -583,20 +579,23 @@ static void test_realtime_signal_queue(void)
 	signal(SIGRTMIN, SIG_DFL);
 }
 
-/* sigsuspend.html RETURN VALUE: "If a return occurs, -1 shall be
- * returned and errno set to [EINTR]." src/signal/signal.c's
- * sigsuspend() is a documented permanent stub: there is no per-thread
- * suspend/wake primitive to atomically replace the mask and block. It
- * happens to satisfy this one narrow
- * return-value clause unconditionally; the DESCRIPTION clause that it
- * replace the mask and actually wait for a signal is N/A (see ledger
- * fragment) rather than tested, since it can never be made to pass. */
-static void test_sigsuspend_stub(void)
+/* A signal made pending under the current mask becomes eligible under
+ * sigsuspend()'s temporary mask.  This proves both mask replacement and
+ * the required EINTR return without relying on a timing race. */
+static void test_sigsuspend(void)
 {
-	sigset_t s;
-	sigemptyset(&s);
+	sigset_t blocked, temporary;
+
+	signal(SIGUSR1, dummy_handler);
+	sigemptyset(&blocked);
+	sigaddset(&blocked, SIGUSR1);
+	CHECK(sigprocmask(SIG_SETMASK, &blocked, NULL) == 0);
+	CHECK(kill(getpid(), SIGUSR1) == 0);
+	sigemptyset(&temporary);
 	errno = 0;
-	CHECK(sigsuspend(&s) == -1 && errno == EINTR);
+	CHECK(sigsuspend(&temporary) == -1 && errno == EINTR);
+	CHECK(sigprocmask(SIG_SETMASK, &temporary, NULL) == 0);
+	signal(SIGUSR1, SIG_DFL);
 }
 
 /* ================================================================== *
@@ -1588,10 +1587,19 @@ static void test_sigignore(void)
 
 static void test_sigpause(void)
 {
-	/* "whereupon it shall return -1 and set errno to [EINTR]".  See the
-	 * banner above for why only the wakeup half is observable here. */
+	sigset_t one;
+
+	/* Hold a real pending signal, then let sigpause() temporarily unblock
+	 * it.  The call must wait for/deliver that signal and report EINTR. */
+	signal(SIGUSR1, dummy_handler);
+	sigemptyset(&one);
+	sigaddset(&one, SIGUSR1);
+	CHECK(sigprocmask(SIG_BLOCK, &one, NULL) == 0);
+	CHECK(kill(getpid(), SIGUSR1) == 0);
 	errno = 0;
 	CHECK(sigpause(SIGUSR1) == -1 && errno == EINTR);
+	CHECK(sigprocmask(SIG_UNBLOCK, &one, NULL) == 0);
+	signal(SIGUSR1, SIG_DFL);
 }
 
 static void test_siginterrupt(void)
@@ -1848,7 +1856,7 @@ int main(int argc, char **argv)
 	test_sigprocmask();
 	test_sigpending();
 	test_realtime_signal_queue();
-	test_sigsuspend_stub();
+	test_sigsuspend();
 	test_abort_overrides(argv[0]);
 	if (flush_probe_channel_works(argv[0])) {
 		test_terminating_signal_does_not_flush_stdio(argv[0]);

@@ -14,9 +14,9 @@
  * kill() to ANOTHER process is different, in one specific and bounded
  * way, as of src/signal/sigdelivery.c: it first tries to hand the target
  * process's own listener a small packet naming the signal, so that
- * process's own delivery thread can drive its own real disposition
- * (sa_handler/SIG_IGN, not just the default action) through
- * __raise_internal() -- see that file's banner for the whole mechanism,
+ * process's own delivery thread can queue the packet against its real
+ * disposition and process-wide pending state -- see that file's banner
+ * for the whole mechanism,
  * including the fast-fail guarantee for a target with no listener. What
  * this does NOT do is interrupt the target thread wherever it happens
  * to be: nothing here touches another thread's register state
@@ -25,10 +25,8 @@
  * kernel or Cygwin's exceptions.cc does it -- is out of scope; see
  * sigdelivery.c's banner for why). A signal delivered this way is only
  * guaranteed to be acted on the next time the target thread reaches a
- * point that checks for one: sig_delivery_thread() calling
- * __raise_internal() itself (immediately, on its own thread, for a
- * signal that is not blocked), or src/select/select.c's poll loop,
- * which is taught to notice one early because it already polls. Code
+ * point that checks for one, such as the alertable sleep and signal-wait
+ * loops or src/select/select.c's poll loop. Code
  * running ordinary instructions between syscalls on the application
  * thread does not get interrupted out of them by this.
  *
@@ -58,6 +56,8 @@
 static void (*handlers[_NSIG])(int);
 static __thread sigset_t blocked;
 static __thread sigset_t thread_pending;
+static __thread siginfo_t thread_pending_info[SIGQUEUE_MAX];
+static __thread int thread_pending_count;
 static sigset_t pending;
 
 /* Standard signals coalesce while pending. Real-time signals retain one
@@ -86,6 +86,7 @@ void __sig_current_mask_install(const sigset_t *mask)
 {
 	blocked = *mask;
 	sigemptyset(&thread_pending);
+	thread_pending_count = 0;
 }
 
 /* Set only by exception_handler(), immediately around its call into
@@ -111,6 +112,38 @@ static void make_siginfo(siginfo_t *si, int sig)
 		si->si_pid = getpid();
 		si->si_uid = getuid();
 	}
+}
+
+static int queue_thread_pending(int sig, const siginfo_t *si)
+{
+	int realtime = sig >= SIGRTMIN && sig <= SIGRTMAX;
+	if (!realtime && sigismember(&thread_pending, sig)) return 0;
+	if (thread_pending_count >= SIGQUEUE_MAX) { errno = EAGAIN; return -1; }
+	thread_pending_info[thread_pending_count++] = *si;
+	sigaddset(&thread_pending, sig);
+	return 0;
+}
+
+static int take_thread_pending_signal(int sig, siginfo_t *si)
+{
+	int i;
+	for (i = 0; i < thread_pending_count; i++) {
+		if (thread_pending_info[i].si_signo != sig) continue;
+		if (si) *si = thread_pending_info[i];
+		thread_pending_count--;
+		memmove(&thread_pending_info[i], &thread_pending_info[i + 1],
+		        (size_t)(thread_pending_count - i) * sizeof thread_pending_info[0]);
+		for (i = 0; i < thread_pending_count; i++)
+			if (thread_pending_info[i].si_signo == sig) return 1;
+		sigdelset(&thread_pending, sig);
+		return 1;
+	}
+	if (sigismember(&thread_pending, sig)) {
+		if (si) make_siginfo(si, sig);
+		sigdelset(&thread_pending, sig);
+		return 1;
+	}
+	return 0;
 }
 
 static int queue_pending(int sig, const siginfo_t *si)
@@ -154,8 +187,7 @@ static int take_pending_from_set(const sigset_t *set, siginfo_t *si)
 	for (sig = 1; sig < _NSIG; sig++) {
 		if (!sigismember(set, sig)) continue;
 		if (sigismember(&thread_pending, sig)) {
-			sigdelset(&thread_pending, sig);
-			if (si) make_siginfo(si, sig);
+			take_thread_pending_signal(sig, si);
 			return sig;
 		}
 		if (sigismember(&pending, sig)) {
@@ -497,10 +529,11 @@ int __raise_internal_info(int sig, const void *data)
 		 * deferred one of those signals, restoring its entry mask is the
 		 * point at which the newly-unblocked pending signal is delivered. */
 		for (i = 1; i < _NSIG; i++) {
-			if (sigismember(&thread_pending, i) &&
-			    !sigismember(&blocked, i)) {
-				sigdelset(&thread_pending, i);
-				__raise_internal(i);
+			while (sigismember(&thread_pending, i) &&
+			       !sigismember(&blocked, i)) {
+				siginfo_t info;
+				take_thread_pending_signal(i, &info);
+				__raise_internal_info(i, &info);
 			}
 		}
 	}
@@ -509,9 +542,29 @@ int __raise_internal_info(int sig, const void *data)
 
 int __raise_internal(int sig) { return __raise_internal_info(sig, 0); }
 
+int __sig_queue_process_info(int sig, const void *data)
+{
+	siginfo_t generated;
+	const siginfo_t *info = data;
+	int result;
+
+	if (!sig_valid(sig)) { errno = EINVAL; return -1; }
+	if (!info) {
+		make_siginfo(&generated, sig);
+		info = &generated;
+	}
+	__sig_lock();
+	result = queue_pending(sig, info);
+	__sig_unlock();
+	return result;
+}
+
 int __raise_thread_internal(int sig)
 {
 	int pending_sig;
+	siginfo_t info;
+
+	if (!sig_valid(sig)) { errno = EINVAL; return -1; }
 
 	/* A process-directed signal generated by a thread which blocks it is
 	 * left process-pending.  A later thread-directed delivery is a safe
@@ -526,8 +579,8 @@ int __raise_thread_internal(int sig)
 		}
 	}
 	if (sigismember(&blocked, sig)) {
-		sigaddset(&thread_pending, sig);
-		return 0;
+		make_siginfo(&info, sig);
+		return queue_thread_pending(sig, &info);
 	}
 	return __raise_internal(sig);
 }
@@ -792,10 +845,11 @@ int sigprocmask(int how, const sigset_t *set, sigset_t *old)
 				take_pending_signal(i, &si);
 				__raise_internal_info(i, &si);
 			}
-			if (sigismember(&thread_pending, i) &&
-			    !sigismember(&blocked, i)) {
-				sigdelset(&thread_pending, i);
-				__raise_internal(i);
+			while (sigismember(&thread_pending, i) &&
+			       !sigismember(&blocked, i)) {
+				siginfo_t si;
+				take_thread_pending_signal(i, &si);
+				__raise_internal_info(i, &si);
 			}
 		}
 	}
@@ -839,6 +893,8 @@ static int suspend_with_mask(const sigset_t *mask)
 	if (sigprocmask(SIG_SETMASK, mask, &saved) < 0) return -1;
 	while (thread_caught_count == caught) {
 		LARGE_INTEGER delay = -1000000; /* 100ms, interruptible by APCs */
+		__sig_drain_pending();
+		if (thread_caught_count != caught) break;
 		NtDelayExecution(TRUE, &delay);
 	}
 	(void)sigprocmask(SIG_SETMASK, &saved, 0);
@@ -855,6 +911,7 @@ void __sig_pending_reset_after_fork(void)
 {
 	sigemptyset(&pending);
 	sigemptyset(&thread_pending);
+	thread_pending_count = 0;
 	pending_count = 0;
 	wait_active = 0;
 }
