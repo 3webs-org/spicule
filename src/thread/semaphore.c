@@ -288,12 +288,12 @@ int sem_wait(sem_t *sem)
 	unsigned long caught;
 	int r;
 	if (!valid(sem)) { errno = EINVAL; return -1; }
-	caught = __sig_caught_count();
+	caught = __sig_thread_caught_count();
 	for (;;) {
 		r = wait_handle(sem, &slice);
 		if (!r) return 0;
 		if (errno != EAGAIN) return -1;
-		if (__sig_caught_count() != caught) { errno = EINTR; return -1; }
+		if (__sig_thread_caught_count() != caught) { errno = EINTR; return -1; }
 	}
 }
 
@@ -308,7 +308,7 @@ int sem_timedwait(sem_t *sem, const struct timespec *abstime)
 	if (!abstime || abstime->tv_nsec < 0 || abstime->tv_nsec >= 1000000000L) {
 		errno = EINVAL; return -1;
 	}
-	caught = __sig_caught_count();
+	caught = __sig_thread_caught_count();
 	for (;;) {
 		clock_gettime(CLOCK_REALTIME, &now);
 		ns = (long long)(abstime->tv_sec - now.tv_sec) * 1000000000LL + abstime->tv_nsec - now.tv_nsec;
@@ -317,7 +317,7 @@ int sem_timedwait(sem_t *sem, const struct timespec *abstime)
 		rel = -(ns / 100);
 		if (wait_handle(sem, &rel) == 0) return 0;
 		if (errno != EAGAIN) return -1;
-		if (__sig_caught_count() != caught) { errno = EINTR; return -1; }
+		if (__sig_thread_caught_count() != caught) { errno = EINTR; return -1; }
 	}
 }
 
