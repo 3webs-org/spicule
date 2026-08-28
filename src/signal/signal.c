@@ -151,11 +151,18 @@ static int take_pending_signal(int sig, siginfo_t *si)
 static int take_pending_from_set(const sigset_t *set, siginfo_t *si)
 {
 	int sig;
-	for (sig = 1; sig < _NSIG; sig++)
-		if (sigismember(set, sig) && sigismember(&pending, sig)) {
+	for (sig = 1; sig < _NSIG; sig++) {
+		if (!sigismember(set, sig)) continue;
+		if (sigismember(&thread_pending, sig)) {
+			sigdelset(&thread_pending, sig);
+			if (si) make_siginfo(si, sig);
+			return sig;
+		}
+		if (sigismember(&pending, sig)) {
 			take_pending_signal(sig, si);
 			return sig;
 		}
+	}
 	return 0;
 }
 
@@ -633,16 +640,22 @@ int kill(pid_t pid, int sig)
 	 * (1) that names no real process -- ESRCH for a call POSIX
 	 * requires to succeed against the caller's own, real, group. */
 	if (pid == getpid() || pid == getpgrp() || pid == 0 || pid == -1) {
+		int result;
 		if (!sig) return 0;
 		/* Including a stop signal, which is *not* routed through
 		 * NtSuspendProcess the way the cross-process arm below is.
 		 * Suspending yourself here is not a stop but a hang: nothing
 		 * delivers asynchronously (this file's header comment), so the
 		 * only code that could ever call kill(pid, SIGCONT) is code in
-		 * this same suspended process.  raise() therefore applies the
-		 * ordinary default action -- terminate -- which is at least an
-		 * outcome the caller's parent can see and report. */
-		return raise(sig);
+		 * this same suspended process.  Process-directed delivery still
+		 * applies the ordinary default action -- terminate -- which is at
+		 * least an outcome the caller's parent can see and report.  Unlike
+		 * raise(), it leaves a signal blocked by this thread process-pending
+		 * so another thread's sigwait() can claim it. */
+		__sig_lock();
+		result = __raise_internal(sig);
+		__sig_unlock();
+		return result < 0 ? -1 : 0;
 	}
 	if (pid < 0) { errno = ESRCH; return -1; }
 	c = __child_find(pid);
@@ -803,7 +816,26 @@ int __sig_pending_member(int sig) {
 	return sigismember(&pending, sig) ||
 		sigismember(&thread_pending, sig);
 }
-int sigsuspend(const sigset_t *s) { (void)s; errno = EINTR; return -1; }
+static int suspend_with_mask(const sigset_t *mask)
+{
+	sigset_t saved;
+	unsigned long caught = thread_caught_count;
+
+	if (!mask) { errno = EFAULT; return -1; }
+	if (sigprocmask(SIG_SETMASK, mask, &saved) < 0) return -1;
+	while (thread_caught_count == caught) {
+		LARGE_INTEGER delay = -1000000; /* 100ms, interruptible by APCs */
+		NtDelayExecution(TRUE, &delay);
+	}
+	(void)sigprocmask(SIG_SETMASK, &saved, 0);
+	errno = EINTR;
+	return -1;
+}
+
+int sigsuspend(const sigset_t *s)
+{
+	return suspend_with_mask(s);
+}
 
 void __sig_pending_reset_after_fork(void)
 {
@@ -920,7 +952,7 @@ int sigwait(const sigset_t *s, int *sig)
 			 * negative means relative, in 100ns units, so this is 100ms
 			 * -- the same convention src/unistd/sleep.c uses. */
 			LARGE_INTEGER d = -1000000;
-			NtDelayExecution(FALSE, &d);
+			NtDelayExecution(TRUE, &d);
 		}
 	}
 }
@@ -943,7 +975,7 @@ int sigwaitinfo(const sigset_t *set, siginfo_t *info)
 		__sig_unlock();
 		{
 			LARGE_INTEGER d = -100000; /* 10ms */
-			NtDelayExecution(FALSE, &d);
+			NtDelayExecution(TRUE, &d);
 		}
 	}
 }
@@ -987,7 +1019,7 @@ int sigtimedwait(const sigset_t *set, siginfo_t *info, const struct timespec *ti
 		{
 			long long left = limit - elapsed;
 			LARGE_INTEGER d = -(left < 10000000LL ? (left + 99) / 100 : 100000);
-			NtDelayExecution(FALSE, &d);
+			NtDelayExecution(TRUE, &d);
 		}
 	}
 }
@@ -1133,7 +1165,15 @@ void (*sigset(int sig, void (*h)(int)))(int)
 	if (sigprocmask(SIG_UNBLOCK, &one, 0) < 0) return SIG_ERR;
 	return SIG_HOLD;
 }
-int sigpause(int sig) { (void)sig; errno = EINTR; return -1; }
+int sigpause(int sig)
+{
+	sigset_t mask;
+
+	if (!sig_valid(sig)) { errno = EINVAL; return -1; }
+	mask = blocked;
+	sigdelset(&mask, sig);
+	return suspend_with_mask(&mask);
+}
 
 /* SEGV_MAPERR vs SEGV_ACCERR (signal.h.html siginfo_t DESCRIPTION) for
  * an EXCEPTION_ACCESS_VIOLATION/EXCEPTION_IN_PAGE_ERROR fault: NT's
