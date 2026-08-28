@@ -125,15 +125,15 @@ fork/11-1.c	runtime=wine,target_arch=x86_64,kernel32=no	BUG	fcntl record locks a
 fork/12-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured PASS after pthread_atfork and child-thread reset implementation
 fork/13-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	-
 fork/14-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured PASS after pthread_atfork and child-thread reset implementation
-fork/16-1.c	runtime=wine,target_arch=x86_64,kernel32=no	UNIMPL	OPTS class A: compile/link blocked by pthread.h sys/mman.h
+fork/16-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	-
 fork/17-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured PASS after pthread_atfork and child-thread reset implementation
 fork/17-2.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured PASS after pthread_atfork and child-thread reset implementation
-fork/18-1.c	runtime=wine,target_arch=x86_64,kernel32=no	UNIMPL	OPTS class A: compile/link blocked by pthread.h
+fork/18-1.c	runtime=wine,target_arch=x86_64,kernel32=no	BUG	timer_create rejects the valid SIGEV_THREAD notification mode with EINVAL
 fork/19-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured PASS after pthread_atfork and child-thread reset implementation
 fork/2-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured PASS after pthread_atfork and child-thread reset implementation
 fork/21-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured PASS after pthread_atfork and child-thread reset implementation
 fork/22-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured PASS after pthread_atfork and child-thread reset implementation
-fork/3-1.c	runtime=wine,target_arch=x86_64,kernel32=no	UNIMPL	OPTS class A: compile/link blocked by pthread.h
+fork/3-1.c	runtime=wine,target_arch=x86_64,kernel32=no	BUG	kill(child_pid, 0) still succeeds after waitpid reaps the child instead of reporting ESRCH
 fork/4-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured PASS after pthread_atfork and child-thread reset implementation
 fork/6-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured PASS after pthread_atfork and child-thread reset implementation
 fork/7-1.c	runtime=wine,target_arch=x86_64,kernel32=no	NA	suite prerequisite is unavailable: the test requires an external gencat utility to generate its message catalog
@@ -517,7 +517,7 @@ pthread_condattr_setpshared/2-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PA
 pthread_create/1-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	OPTS: observed PASS after pthread lifecycle and scheduling implementation
 pthread_create/1-2.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured PASS in pthread-wide audit after pthread implementation
 pthread_create/1-3.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured PASS in pthread-wide audit after pthread implementation
-pthread_create/1-5.c	runtime=wine,target_arch=x86_64,kernel32=no	UNIMPL	OPTS class A: compile/link blocked by pthread.h semaphore.h
+pthread_create/1-5.c	runtime=wine,target_arch=x86_64,kernel32=no	BUG	pthread_create ignores the caller-supplied alternative stack in the thread attributes
 pthread_create/1-6.c	runtime=wine,target_arch=x86_64,kernel32=no	BUG	explicit SCHED_FIFO priorities do not enforce the expected high-before-low thread execution order
 pthread_create/11-1.c	runtime=wine,target_arch=x86_64,kernel32=no	NA	test requires the optional _POSIX_THREAD_CPUTIME facility, which ntlibc reports unsupported
 pthread_create/12-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	OPTS: observed PASS after pthread lifecycle and scheduling implementation
@@ -525,7 +525,7 @@ pthread_create/14-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured 
 pthread_create/15-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	measured PASS after advertising implemented pthread limits and options
 pthread_create/2-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	OPTS: observed PASS after pthread lifecycle and scheduling implementation
 pthread_create/3-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	OPTS: observed PASS after pthread lifecycle and scheduling implementation
-pthread_create/3-2.c	runtime=wine,target_arch=x86_64,kernel32=no	UNIMPL	OPTS class A: compile/link blocked by pthread.h semaphore.h
+pthread_create/3-2.c	runtime=wine,target_arch=x86_64,kernel32=no	BUG	measured running stack bounds do not remain independent of later changes to the source attribute object
 pthread_create/4-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	OPTS: observed PASS after pthread lifecycle and scheduling implementation
 pthread_create/5-1.c	runtime=wine,target_arch=x86_64,kernel32=no	PASS	OPTS: observed PASS after pthread lifecycle and scheduling implementation
 pthread_create/8-1.c	runtime=wine,target_arch=x86_64,kernel32=no	BUG	new native threads inherit the process-wide pending-signal set instead of starting with an empty pending set
