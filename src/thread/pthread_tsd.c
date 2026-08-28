@@ -142,6 +142,7 @@ static void reset_once(void *argument)
 
 int pthread_once(pthread_once_t *control, void (*initialize)(void))
 {
+	__sig_drain_pending();
 	for (;;) {
 		RtlAcquirePebLock();
 		if (*control == 2) {

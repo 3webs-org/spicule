@@ -21,6 +21,7 @@ int pthread_atfork(void (*prepare)(void), void (*parent)(void),
 {
 	struct atfork_handler *new_handlers;
 	size_t capacity;
+	__sig_drain_pending();
 	RtlAcquirePebLock();
 	if (handler_count == handler_capacity) {
 		capacity = handler_capacity ? handler_capacity * 2 : 8;

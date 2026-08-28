@@ -88,6 +88,7 @@ pthread_t pthread_self(void)
 
 int pthread_equal(pthread_t left, pthread_t right)
 {
+	__sig_drain_pending();
 	return left == right;
 }
 
@@ -207,8 +208,21 @@ int pthread_create(pthread_t *__restrict output,
 	return 0;
 }
 
+struct join_cleanup {
+	pthread_t thread;
+};
+
+static void reset_joining(void *argument)
+{
+	struct join_cleanup *cleanup = argument;
+	RtlAcquirePebLock();
+	cleanup->thread->joining = 0;
+	RtlReleasePebLock();
+}
+
 int pthread_join(pthread_t thread, void **result)
 {
+	struct join_cleanup cleanup;
 	NTSTATUS status;
 	if (!thread || thread->magic != PTHREAD_MAGIC) return ESRCH;
 	if (thread == __pthread_current()) return EDEADLK;
@@ -223,12 +237,20 @@ int pthread_join(pthread_t thread, void **result)
 	}
 	thread->joining = 1;
 	RtlReleasePebLock();
-	status = NtWaitForSingleObject(thread->handle, TRUE, 0);
+	cleanup.thread = thread;
+	pthread_cleanup_push(reset_joining, &cleanup);
+	for (;;) {
+		__pthread_testcancel();
+		status = NtWaitForSingleObject(thread->handle, TRUE, 0);
+		__pthread_testcancel();
+		if (status != STATUS_USER_APC && status != STATUS_ALERTED) break;
+	}
+	pthread_cleanup_pop(0);
 	if (!NT_SUCCESS(status)) {
 		RtlAcquirePebLock();
 		thread->joining = 0;
 		RtlReleasePebLock();
-		return status == STATUS_USER_APC || status == STATUS_ALERTED ? EINTR : EINVAL;
+		return EINVAL;
 	}
 	if (result) *result = thread->result;
 	NtClose(thread->handle);
@@ -458,6 +480,7 @@ int pthread_getschedparam(pthread_t thread, int *__restrict policy,
 int pthread_setschedparam(pthread_t thread, int policy,
 	const struct sched_param *parameter)
 {
+	__sig_drain_pending();
 	if (!thread || thread->magic != PTHREAD_MAGIC || thread->joined ||
 	    (!thread->handle && thread->exited)) return ESRCH;
 	if (!parameter || !valid_policy(policy) ||
