@@ -22,9 +22,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <limits.h>
 #include <errno.h>
+#include "libc.h"
+
+static unsigned long tombstone_sequence;
 
 static const char *shm_tmpdir(void)
 {
@@ -124,11 +128,44 @@ int shm_open(const char *name, int oflag, mode_t mode)
 int shm_unlink(const char *name)
 {
 	char *path = shm_path(name);
+	char *tombstone;
+	char *slash;
+	size_t prefix;
 	int result, saved;
+	LARGE_INTEGER now;
+	unsigned long sequence;
 
 	if (!path) return -1;
 	result = unlink(path);
 	saved = errno;
+	/* Wine and older NT filesystems can reject delete disposition while a
+	 * data section still maps the backing file, even though every handle was
+	 * opened with FILE_SHARE_DELETE.  A same-directory rename still removes
+	 * the POSIX name atomically.  Best-effort deletion of the private
+	 * tombstone follows; if the runtime cannot mark it until the last mapping
+	 * closes, leaving an unreachable backing file is preferable to falsely
+	 * reporting that the public shm name remains linked. */
+	if (result < 0 && saved == EACCES) {
+		slash = strrchr(path, '/');
+		prefix = slash ? (size_t)(slash - path + 1) : 0;
+		tombstone = malloc(prefix + 80);
+		if (tombstone) {
+			memcpy(tombstone, path, prefix);
+			NtQuerySystemTime(&now);
+			RtlAcquirePebLock();
+			sequence = ++tombstone_sequence;
+			RtlReleasePebLock();
+			snprintf(tombstone + prefix, 80,
+				".ntlibc-shm-deleted-%d-%llu-%lu", (int)getpid(),
+				(unsigned long long)now, sequence);
+			if (rename(path, tombstone) == 0) {
+				(void)unlink(tombstone);
+				result = 0;
+				saved = 0;
+			} else saved = errno;
+			free(tombstone);
+		}
+	}
 	free(path);
 	errno = saved;
 	return result;
