@@ -510,8 +510,9 @@ libc-test-strict: $(ALL_LIBS)
 # third_party/README.md), adjudicated case by case.
 #
 # `posix-optsrun-pedantic` checks all 1610 profile dispositions: PASS and
-# BUG cases compile and run, UNIMPL cases must fail compilation, NA cases
-# stay out, and FLAKY cases remain observable without weakening strict.
+# BUG cases compile and run, NA cases stay out, and FLAKY cases remain
+# observable without weakening strict.  There are no UNIMPL dispositions;
+# a future one would still be required to fail compilation by the driver.
 #
 # This absorbed the separate `posix-gapmap` compile-only census, which
 # measured the same 1610 cases and gated four AGGREGATE invariants over
@@ -524,14 +525,12 @@ libc-test-strict: $(ALL_LIBS)
 #                        the discovered set equals the annotated set, so
 #                        an unannotated or stale case is a hard error
 #                        rather than a count that still adds up.
-#   floor (links)        358 PASS + 199 BUG cases must build and run.  A
+#   floor (links)        1404 PASS + 77 BUG cases must build and run.  A
 #                        compiler that stopped finding lib/libc.a fails
-#                        557 cases by name, not one threshold.
-#   floor (blocked)      1016 UNIMPL cases must FAIL to build.  The
-#                        dangerous direction -- an -I that starts
-#                        pointing at a host libc, making everything link
-#                        and the gap read as closed -- is now caught 1016
-#                        times over instead of by a single floor.
+#                        1481 cases by name, not one threshold.
+#   floor (blocked)      the UNIMPL partition is empty.  Any future source
+#                        which stops building must be deliberately added
+#                        with a named reason rather than hidden by a floor.
 #   canaries             two hand-picked cases were a proxy for "the
 #                        classifier still discriminates".  The ledger
 #                        checks all 1610 in both directions.
