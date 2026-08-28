@@ -151,7 +151,9 @@ static int cond_wait(pthread_cond_t *__restrict cond,
 	struct cond_waiter waiter;
 	struct cond_cleanup cleanup;
 	int result = 0, lock_error = 0, old_state = PTHREAD_CANCEL_ENABLE;
-	int error = cond_ready(cond);
+	int error;
+	__sig_drain_pending();
+	error = cond_ready(cond);
 	if (error) return error;
 	if (!mutex) return EINVAL;
 	if (absolute && (absolute->tv_sec < 0 || absolute->tv_nsec < 0 ||
@@ -246,7 +248,9 @@ int pthread_cond_signal(pthread_cond_t *cond)
 {
 	struct cond_data *data;
 	struct cond_waiter *waiter;
-	int error = cond_ready(cond);
+	int error;
+	__sig_drain_pending();
+	error = cond_ready(cond);
 	if (error) return error;
 	data = cond_data(cond);
 	RtlAcquirePebLock();
@@ -263,7 +267,9 @@ int pthread_cond_broadcast(pthread_cond_t *cond)
 {
 	struct cond_data *data;
 	struct cond_waiter *waiter;
-	int error = cond_ready(cond);
+	int error;
+	__sig_drain_pending();
+	error = cond_ready(cond);
 	if (error) return error;
 	data = cond_data(cond);
 	RtlAcquirePebLock();

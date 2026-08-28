@@ -186,6 +186,20 @@ unsigned long __sig_caught_count(void) { return caught_count; }
 unsigned long __sig_thread_caught_count(void) { return thread_caught_count; }
 unsigned long __sig_thread_restart_count(void) { return thread_restart_count; }
 
+void __sig_drain_pending(void)
+{
+	int sig;
+	__sig_lock();
+	for (sig = 1; sig < _NSIG; sig++) {
+		while (sigismember(&pending, sig) && !sigismember(&blocked, sig)) {
+			siginfo_t info;
+			take_pending_signal(sig, &info);
+			__raise_internal_info(sig, &info);
+		}
+	}
+	__sig_unlock();
+}
+
 /* sigaction.html, SA_NOCLDWAIT: "If ... set for SIGCHLD ... and the
  * calling process subsequently forks, ... the behavior is unspecified
  * if ... the process either simultaneously has SA_NOCLDWAIT set or has
