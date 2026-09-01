@@ -9,6 +9,14 @@ unsigned strict_bound(unsigned n)
 	return i;
 }
 
+unsigned affine_strict_bound(unsigned n)
+{
+	unsigned i;
+	for (i = 0; i + 2 < n; i++) {
+	}
+	return i;
+}
+
 unsigned conjunctive_bound(unsigned n, int stop)
 {
 	unsigned i;
@@ -33,11 +41,37 @@ int inclusive_countdown(void)
 	return i;
 }
 
+int signed_nonunit_step(int n)
+{
+	int i;
+	for (i = 0; i <= n; i += 3) {
+	}
+	return i;
+}
+
+static unsigned stable_file_bound = 8;
+
+unsigned stable_file_bound_loop(void)
+{
+	unsigned i;
+	for (i = 0; i < stable_file_bound; i++) {
+	}
+	return i;
+}
+
 unsigned sentinel_pointer(const unsigned char *p)
 {
 	const unsigned char *start = p;
 	while (*p != 0)
 		p++;
+	return (unsigned)(p - start);
+}
+
+unsigned sentinel_pointer_variable_step(const unsigned char *p)
+{
+	const unsigned char *start = p;
+	while (*p != 0)
+		p += (unsigned)*p + 1;
 	return (unsigned)(p - start);
 }
 
@@ -68,6 +102,60 @@ unsigned assigned_radix_countdown(unsigned n)
 	while (n)
 		n = n / 10;
 	return n;
+}
+
+unsigned shifted_countdown(unsigned n)
+{
+	while (n)
+		n >>= 3;
+	return n;
+}
+
+unsigned explicit_cast_bound(unsigned n)
+{
+	unsigned long i;
+	for (i = 0; i < (unsigned long)n; i++) {
+	}
+	return (unsigned)i;
+}
+
+int signed_countdown(int n)
+{
+	while (n)
+		n--;
+	return n;
+}
+
+int signed_radix_countdown(int n)
+{
+	while (n != 0)
+		n /= 10;
+	return n;
+}
+
+unsigned chunked_countdown(unsigned n)
+{
+	while (n >= 3)
+		n -= 3;
+	return n;
+}
+
+unsigned sizeof_chunked_countdown(unsigned n)
+{
+	for (; n >= sizeof(unsigned); n -= sizeof(unsigned)) {
+	}
+	return n;
+}
+
+struct counter {
+	unsigned n;
+};
+
+unsigned member_countdown(struct counter *counter)
+{
+	while (counter->n)
+		counter->n--;
+	return counter->n;
 }
 
 int signed_extra_progress(int n, int skip)
@@ -171,17 +259,6 @@ unsigned member_bound_while(struct vec *p)
 		if (p->v[i] == 0)
 			return i;
 		i++;
-	}
-	return i;
-}
-
-unsigned member_bound_unrelated_call(struct vec *p)
-{
-	unsigned i;
-	for (i = 0; i < p->n; i++) {
-		/* Calling something that is never handed p itself cannot
-		 * reach back through p->n, so this must stay provable. */
-		(void)guarded_recursion(1);
 	}
 	return i;
 }

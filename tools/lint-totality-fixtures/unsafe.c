@@ -110,6 +110,25 @@ unsigned division_by_one_does_not_progress(unsigned n)
 	return n;
 }
 
+unsigned nonunit_countdown_can_wrap(unsigned n)
+{
+	while (n) { /* totality-expect */
+		n -= 2;
+	}
+	return n;
+}
+
+unsigned mismatched_guarded_steps(unsigned n, int choose)
+{
+	while (n >= 3) { /* totality-expect */
+		if (choose)
+			n -= 3;
+		else
+			n -= 5;
+	}
+	return n;
+}
+
 unsigned cancelled_comma_increment(unsigned n)
 {
 	unsigned i;
@@ -180,6 +199,151 @@ unsigned member_bound_base_reseated(struct vec *p, struct vec *q)
 	unsigned i;
 	for (i = 0; i < p->n; i++) { /* totality-expect */
 		p = q;
+	}
+	return i;
+}
+
+unsigned mismatched_member_rank(struct vec *tested, struct vec *changed)
+{
+	while (tested->n) { /* totality-expect */
+		changed->n--;
+	}
+	return tested->n;
+}
+
+unsigned wrapping_pointer_step(const unsigned char *p, unsigned step)
+{
+	while (*p) { /* totality-expect */
+		p += step + 1;
+	}
+	return *p;
+}
+
+unsigned aliased_dereferenced_bound(unsigned *bound, unsigned *alias)
+{
+	unsigned i = 0;
+	while (i < *bound) { /* totality-expect */
+		i++;
+		(*alias)++;
+	}
+	return i;
+}
+
+unsigned volatile_dereferenced_bound(volatile unsigned *bound)
+{
+	unsigned i = 0;
+	while (i < *bound) { /* totality-expect */
+		i++;
+	}
+	return i;
+}
+
+unsigned volatile_member_rank(volatile struct vec *p)
+{
+	while (p->n) { /* totality-expect */
+		p->n--;
+	}
+	return p->n;
+}
+
+unsigned volatile_member_base(struct vec * volatile p)
+{
+	while (p->n) { /* totality-expect */
+		p->n--;
+	}
+	return p->n;
+}
+
+unsigned volatile_member_bound(volatile struct vec *p)
+{
+	unsigned i;
+	for (i = 0; i < p->n; i++) { /* totality-expect */
+	}
+	return i;
+}
+
+void opaque_mutation(void);
+int opaque_predicate(void);
+
+int signed_division_fixed_point(int n)
+{
+	while (n > -100) { /* totality-expect */
+		n /= 10;
+	}
+	return n;
+}
+
+unsigned division_zero_fixed_point(unsigned n, const unsigned char *table)
+{
+	while (table[n]) { /* totality-expect */
+		n /= 2;
+	}
+	return n;
+}
+
+unsigned shift_zero_fixed_point(unsigned n, const unsigned char *table)
+{
+	while (table[n]) { /* totality-expect */
+		n >>= 1;
+	}
+	return n;
+}
+
+unsigned member_bound_across_opaque_call(struct vec *p)
+{
+	unsigned i;
+	for (i = 0; i < p->n; i++) { /* totality-expect */
+		opaque_mutation();
+	}
+	return i;
+}
+
+unsigned member_rank_across_opaque_call(struct vec *p)
+{
+	while (p->n) { /* totality-expect */
+		opaque_mutation();
+		p->n--;
+	}
+	return p->n;
+}
+
+unsigned member_rank_with_condition_call(struct vec *p)
+{
+	while (p->n && opaque_predicate()) { /* totality-expect */
+		p->n--;
+	}
+	return p->n;
+}
+
+static unsigned file_bound = 8;
+static unsigned file_remaining = 8;
+static unsigned *escaped_bound;
+
+unsigned file_bound_across_opaque_call(void)
+{
+	unsigned i;
+	for (i = 0; i < file_bound; i++) { /* totality-expect */
+		opaque_mutation();
+	}
+	return i;
+}
+
+unsigned file_rank_across_opaque_call(void)
+{
+	while (file_remaining) { /* totality-expect */
+		opaque_mutation();
+		file_remaining--;
+	}
+	return file_remaining;
+}
+
+unsigned escaped_scalar_bound_across_opaque_call(unsigned bound)
+{
+	unsigned i = 0;
+	escaped_bound = &bound;
+	while (i < bound) { /* totality-expect */
+		opaque_mutation();
+		i++;
 	}
 	return i;
 }
