@@ -2,85 +2,59 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * nm(1p): `nm [-g] [-p] [-u] [-v] [file...]`
+ * Spec: https://pubs.opengroup.org/onlinepubs/9699919799/utilities/nm.html
  *
- * ---- scope: ELF64 (aarch64/x86_64), not PE/COFF object files -----------
+ * Scope: ELF64 (aarch64/x86_64) object files only, matching this build's
+ * native-Linux target (src/dlfcn/linux/plat_dlfcn.c). PE is not attempted:
+ * this project's PE parsing (src/internal/pe.c/pe.h) walks a *mapped
+ * executable image's* export directory, a different on-disk structure
+ * from a COFF *object file's* symbol table. A file not starting "\x7fELF"
+ * is reported as unrecognized, never guessed at as PE. This project ships
+ * no <elf.h>; this file keeps its own local Ehdr/Shdr/Sym copy,
+ * cross-checked field-for-field against plat_dlfcn.c's.
  *
- * This build's native-Linux target produces ELF64 little-endian object
- * files (see src/dlfcn/linux/plat_dlfcn.c) -- that is the format this
- * file reads. PE is not attempted: this project's existing PE parsing
- * (src/internal/pe.c/pe.h) walks a *mapped executable image's* export
- * directory, a different on-disk structure from a COFF *object file's*
- * symbol table, and a correct from-scratch reader for the latter is a
- * comparably-sized project of its own. A file not starting "\x7fELF" is
- * reported as an unrecognized format (see read_elf_object() below),
- * never guessed at as PE. ELF32/i386 is out of scope for the same reason
- * plat_dlfcn.c draws the EM_AARCH64/EM_X86_64-only boundary.
+ * Archives: POSIX requires processing each object file inside an archive
+ * operand. Walking this project's own ar(1p) "!<arch>\n" format to run
+ * this file's ELF reader over each member is deferred out of this first
+ * pass -- an archive operand is refused loudly rather than misread as a
+ * malformed ELF file.
  *
- * ---- from-scratch ELF64 structures, not a shared <elf.h> ---------------
+ * Options implemented:
+ *  -g  Only external (global/weak) symbols, i.e. bind != LOCAL.
+ *  -u  Only undefined symbols (st_shndx == SHN_UNDEF).
+ *  -p  Print in the object's own symbol-table order, not alphabetical.
+ *  -v  Sort by symbol value (address) instead of by name.
  *
- * This project ships no <elf.h>; this file keeps its own local Ehdr/Shdr/
- * Sym copy, cross-checked field-for-field against plat_dlfcn.c's, per
- * this tree's per-file struct-definition convention. No Phdr/Dyn/Rela --
- * this file does no loading or relocation.
+ * Not implemented, refused loudly: -A/-o (pathname prefix, only useful
+ * once archive-member iteration exists), -f (this file's only format is
+ * already the full one), -P (portable output format), -C/-r (demangling,
+ * reverse sort -- cosmetic, GNU-only or not in the POSIX synopsis).
  *
- * ---- archives ------------------------------------------------------------
+ * Output: one symbol per line as `<value> <type> <name>`. <value> is 16
+ * lowercase hex digits, zero-filled, or 16 spaces for an undefined
+ * symbol. <type> is a single letter, uppercase for global/weak, lowercase
+ * for local: 'A' absolute, 'B'/'b' bss, 'C' common, 'D'/'d' initialized
+ * data, 'N' non-loaded (e.g. debug) section, 'R'/'r' read-only data,
+ * 'T'/'t' text, 'U' undefined (always uppercase), 'W'/'w' weak, 'I'/'i'
+ * GNU indirect function (STT_GNU_IFUNC -- an ABI extension both
+ * aarch64/x86_64 toolchains emit, classified distinctly to match what a
+ * real nm reports).
  *
- * POSIX requires processing each object file inside an archive operand.
- * This build's ar(1p) (src/util/ar.c) uses the "!<arch>\n" member
- * format; walking it to run this file's ELF reader over each member is
- * deferred out of this first pass -- an archive operand is refused
- * loudly (see the "!<arch>\n" magic check in __util_nm_main()) rather
- * than misread as a malformed ELF file.
- *
- * ---- OPTIONS implemented -------------------------------------------------
- *  -g  Display only external (global/weak) symbols, i.e. bind != LOCAL.
- *  -u  Display only undefined symbols (st_shndx == SHN_UNDEF).
- *  -p  Do not order the symbols in any particular order (print in
- *      the object's own symbol-table order instead of alphabetical).
- *  -v  Sort output by symbol value (address) instead of alphabetically
- *      by symbol name (ties broken by name either way).
- *
- * ---- NOT IMPLEMENTED, refused loudly -------------------------------------
- *  -A/-o    Prefix every line with the file's pathname (only useful once
- *           archive-member iteration exists above).
- *  -f       "Produce full output" -- this file's only format already is
- *           the full one, so there is nothing for a separate -f to do.
- *  -P       The alternate portable output format (name/type/value/size).
- *  -C, -r   Reverse sort (-r) and demangled-name output (-C, GNU-only,
- *           not in the POSIX synopsis) -- cosmetic, not attempted here.
- *
- * DESCRIPTION/STDOUT: one symbol per line as `<value> <type> <name>`.
- * <value> is 16 lowercase hex digits, zero-filled, or 16 spaces for an
- * undefined symbol. <type> is a single letter, uppercase for global/weak,
- * lowercase for local: 'A' absolute, 'B'/'b' bss, 'C' common, 'D'/'d'
- * initialized data, 'N' non-loaded (e.g. debug) section, 'R'/'r' read-only
- * data, 'T'/'t' text, 'U' undefined (always uppercase), 'W'/'w' weak,
- * 'I'/'i' GNU indirect function (STT_GNU_IFUNC -- an ABI extension both
- * aarch64/x86_64 toolchains emit, classified distinctly rather than
- * folded into 'T'/'t' to match what a real nm reports).
- *
- * A symbol with no name, STT_FILE entries, and AArch64/ARM mapping
- * symbols ($x/$d/$a/$t, see is_mapping_symbol() below) are omitted by
- * default, matching every real nm this project interoperates with.
+ * Omitted by default: a symbol with no name, STT_FILE entries, and
+ * AArch64/ARM mapping symbols ($x/$d/$a/$t, see is_mapping_symbol()
+ * below) -- matching every real nm this project interoperates with.
  *
  * The default alphabetical sort is a plain byte-wise strcmp() on the raw
  * UTF-8 name, not locale-collated -- consistent with this project's own
  * "UTF-8 is the only encoding this library has ever supported" position
- * (src/util/wc.c). This differs from GNU nm's strcoll()-based sort under
- * a non-C locale (e.g. it treats '_' as collation-ignorable), which is
- * accepted as the right tradeoff rather than building a from-scratch
- * glibc collation-table reader.
+ * (src/util/wc.c).
  *
- * OPERANDS: no file operand defaults to a file named `a.out`.
- *
- * EXIT STATUS: diagnose-and-continue across multiple file operands, same
- * as this project's other utilities (e.g. src/util/wc.c) -- one bad
- * operand does not stop the rest, and the final exit status is nonzero.
- *
- * Spec consulted: https://pubs.opengroup.org/onlinepubs/9699919799/utilities/nm.html
+ * No file operand defaults to `a.out`. Exit status: diagnose-and-continue
+ * across multiple file operands -- one bad operand doesn't stop the
+ * rest, and the final exit status is nonzero if any failed.
  */
 
-/* This translation unit implements ntlibc's freestanding -nostdinc
+/* This translation unit implements spicule's freestanding -nostdinc
  * public-header contract; transitive ABI declarations are intentional,
  * so hosted include ownership and unused-include advice do not apply. */
 // NOLINTBEGIN(misc-include-cleaner)
@@ -96,12 +70,8 @@
 #include "util.h"
 #include "ownership_stubs.h"
 
-/* ---- minimal local ELF64 shapes ------------------------------------
- * See this file's own header comment above for why these are a fresh
- * local copy rather than a shared <elf.h> or a reach into
- * src/dlfcn/linux/plat_dlfcn.c's private ones. Field widths/order are
- * ELFCLASS64's, architecture-independent -- cross-checked against
- * plat_dlfcn.c's own copy of the same structures. */
+/* Local ELF64 shapes -- see this file's header. Field widths/order are
+ * ELFCLASS64's, architecture-independent. */
 typedef struct {
 	unsigned char e_ident[16];
 	uint16_t e_type, e_machine;
@@ -160,14 +130,11 @@ typedef struct {
 
 /* AArch64 (and ARM) ELF object files carry "mapping symbols" -- local,
  * STT_NOTYPE entries named "$x"/"$d"/"$a"/"$t" (optionally followed by
- * ".<disambiguator>"), inserted by the assembler at every boundary
- * between machine code and data so a disassembler knows how to decode
- * each byte range (AAELF64 SS4.5.4). They carry no symbol-table
- * information a caller of nm(1p) ever wants; every real nm this
- * project needs to interoperate with hides them by default, confirmed
- * empirically against `nix shell nixpkgs#binutils -c nm` on this
- * build's own aarch64 object files (readelf -s shows them, real nm
- * does not). */
+ * ".<disambiguator>"), inserted by the assembler at every code/data
+ * boundary (AAELF64 SS4.5.4). Every real nm hides them by default
+ * (confirmed against `nix shell nixpkgs#binutils -c nm`: readelf -s
+ * shows them, real nm does not). */
+static int is_mapping_symbol(const char *name) __attribute__((nonnull(1)));
 static int is_mapping_symbol(const char *name)
 {
 	if (name[0] != '$') return 0;
@@ -183,13 +150,13 @@ struct nm_sym {
 	char type; /* already-cased type letter, see sym_type_letter() */
 };
 
-/* Classifies one symbol table entry per this file's own header comment
- * ("STDOUT" section) -- section-based for a normal defined symbol,
- * special-cased for undefined/absolute/common/weak/ifunc, then folded
- * to lowercase for a local binding (matching the "uppercase global,
- * lowercase local" convention). `shdrs`/`shnum` are the object's own
- * section header table, needed to classify a defined symbol by the
- * section it lives in. */
+/* Classifies one symbol table entry per this file's header ("Output"
+ * section). `shdrs`/`shnum` are the object's section header table, used
+ * to classify a defined symbol by its section. s->st_info's "not proven
+ * nonnull" finding is left open: __attribute__((nonnull(1))) closes it
+ * but unblocks ValidPointer into a harder question (shdrs[s->st_shndx]
+ * needing an element count tied to shnum that elements_withtok can't
+ * express here) -- a net regression, reverted. */
 static char sym_type_letter(const Elf64_Sym *s, const Elf64_Shdr *shdrs, uint16_t shnum)
 {
 	unsigned bind = ELF64_ST_BIND(s->st_info);
@@ -228,25 +195,36 @@ static char sym_type_letter(const Elf64_Sym *s, const Elf64_Shdr *shdrs, uint16_
 static int cmp_by_name(const void *a, const void *b)
 {
 	const struct nm_sym *sa = a, *sb = b;
+	/* sa->name/sb->name are non-NULL, NUL-terminated: only entries
+	 * passing process_file()'s `if (!name || !*name) continue;` are
+	 * stored into out[], and qsort() only calls this with live out[]
+	 * elements. The restatement below closes null-termination but
+	 * leaves a weaker "not proven nonnull" finding on sa->name -- still
+	 * a net improvement over the three findings with no annotation. */
+	unsafe_assume_string_terminated(sa->name);
+	unsafe_assume_string_terminated(sb->name);
 	return strcmp(sa->name, sb->name);
 }
 
-/* An undefined symbol's "value" is meaningless (it is printed as blank
- * spaces, not a real address -- see this file's own header comment),
- * so -v's value sort treats "undefined" as its own leading group
- * rather than numerically tying every undefined symbol to whatever
- * defined symbol happens to also sit at address 0 -- confirmed against
- * a real `nm -v` on this build's own object files, which puts every U
- * symbol first regardless of a same-object defined symbol's own
- * (perfectly real) value-0 address. */
+/* An undefined symbol's "value" is meaningless (printed as blank spaces,
+ * not a real address), so -v's value sort treats "undefined" as its own
+ * leading group rather than numerically tying it to whatever defined
+ * symbol happens to also sit at address 0 -- confirmed against a real
+ * `nm -v`, which puts every U symbol first regardless. */
 static int cmp_by_value(const void *a, const void *b)
 {
 	const struct nm_sym *sa = a, *sb = b;
+	/* sa/sb "not proven nonnull" is left open here -- same qsort-
+	 * comparator-argument gap as cmp_by_name()'s sa->name; no annotation
+	 * tried closed it without pushing the proof elsewhere. */
 	int ua = sa->type == 'U' || sa->type == 'w';
 	int ub = sb->type == 'U' || sb->type == 'w';
 	if (ua != ub) return ua ? -1 : 1;
 	if (sa->value < sb->value) return -1;
 	if (sa->value > sb->value) return 1;
+	/* See cmp_by_name()'s identical comment. */
+	unsafe_assume_string_terminated(sa->name);
+	unsafe_assume_string_terminated(sb->name);
 	return strcmp(sa->name, sb->name);
 }
 
@@ -257,13 +235,15 @@ static int cmp_by_value(const void *a, const void *b)
  * *out_size) on success, or NULL (errno set, no diagnostic printed --
  * the caller has the pathname for that) on a read/stat/allocation
  * failure. */
+withtok(heap_allocated)
 static unsigned char *read_whole_file(int fd, size_t *out_size)
 {
 	struct stat st;
 	unsigned char *buf;
 	size_t got = 0;
 
-	if (fstat(fd, &st) < 0 || st.st_size < 0) return NULL;
+	if (fstat(fd, &st) < 0) return NULL;
+	if (st.st_size < 0) { errno = EOVERFLOW; return NULL; }
 	*out_size = (size_t)st.st_size;
 
 	buf = malloc(*out_size ? *out_size : 1);
@@ -280,18 +260,23 @@ static unsigned char *read_whole_file(int fd, size_t *out_size)
 		got += (size_t)n;
 	}
 	*out_size = got;
-	__ownership_readable_span(buf, got);
+	unsafe_assume_readable_span(buf, got);
 	return buf;
 }
 
 /* Bounds-checks and locates the symbol table (SHT_SYMTAB, falling back
- * to SHT_DYNSYM if no SHT_SYMTAB section exists -- a stripped or
- * shared-object-shaped file may only have the latter) and its linked
- * string table within an already-validated ELF64 buffer. Returns 1 and
- * fills *symtab, *nsyms, *strtab, *strtab_size on success, or 0 (no
- * diagnostic -- the caller distinguishes "no symbols" from "corrupt"
- * for its own message) if neither section exists or either is
- * malformed. */
+ * to SHT_DYNSYM if none exists -- a stripped or shared-object-shaped
+ * file may only have the latter) and its linked string table within an
+ * already-validated ELF64 buffer. Returns 1 and fills *symtab, *nsyms,
+ * *strtab, *strtab_size on success, or 0 (no diagnostic -- the caller
+ * distinguishes "no symbols" from "corrupt") if neither section exists
+ * or either is malformed.
+ *
+ * shdrs[i]/shdrs[best] "not proven nonnull" is left open:
+ * __attribute__((nonnull(4))) closes it but unblocks exploration into a
+ * harder question (st->sh_offset/st->sh_size needing an element count
+ * tied to e_shnum that nothing here expresses) -- a net regression,
+ * reverted. */
 static int find_symtab(const unsigned char *buf, size_t size, const Elf64_Ehdr *eh,
                         const Elf64_Shdr *shdrs,
                         const Elf64_Shdr **symtab, size_t *nsyms,
@@ -328,6 +313,7 @@ static int find_symtab(const unsigned char *buf, size_t size, const Elf64_Ehdr *
  * `off`, or NULL if `off` is out of range or the string is not
  * terminated before the table's own end (a corrupt/foreign file, not a
  * crash). */
+static const char *strtab_name(const char *strtab, size_t strtab_size, uint32_t off) __attribute__((nonnull(1)));
 static const char *strtab_name(const char *strtab, size_t strtab_size, uint32_t off)
 {
 	size_t i;
@@ -360,11 +346,22 @@ static int process_file(const char *path, int opt_g, int opt_u, int opt_p, int o
 	}
 
 	buf = read_whole_file(fd, &size);
-	close(fd);
+	{
+		/* close() on a freshly-read fd is cleanup, not the operation
+		 * being diagnosed; if it fails, its own errno must not
+		 * overwrite read_whole_file()'s already-set failure reason. */
+		int saved_errno = errno;
+		(void)close(fd);
+		errno = saved_errno;
+	}
 	if (!buf) {
 		__util_diagf("nm: %s: %s\n", path, strerror(errno));
 		return 1;
 	}
+	/* read_whole_file() only ever returns a non-NULL buf together with
+	 * exactly `size` readable bytes -- true by construction, but not a
+	 * fact that survives across the call for this checker. */
+	unsafe_assume_readable_span(buf, size);
 
 	if (size >= 8 && memcmp(buf, "!<arch>\n", 8) == 0) {
 		__util_diagf("nm: %s: archive member listing is not implemented by this "
@@ -396,7 +393,7 @@ static int process_file(const char *path, int opt_g, int opt_u, int opt_p, int o
 		return 1;
 	}
 	shdrs = (const Elf64_Shdr *)(buf + eh->e_shoff);
-	__ownership_readable_span(shdrs, (size_t)eh->e_shnum * sizeof(Elf64_Shdr));
+	unsafe_assume_readable_span(shdrs, (size_t)eh->e_shnum * sizeof(Elf64_Shdr));
 
 	if (!find_symtab(buf, size, eh, shdrs, &symtab, &nsyms, &strtab, &strtab_size)) {
 		__util_diagf("nm: %s: no symbols\n", path);
@@ -413,7 +410,7 @@ static int process_file(const char *path, int opt_g, int opt_u, int opt_p, int o
 
 	{
 		const Elf64_Sym *syms = (const Elf64_Sym *)(buf + symtab->sh_offset);
-		__ownership_readable_span(syms, nsyms * sizeof(Elf64_Sym));
+		unsafe_assume_readable_span(syms, nsyms * sizeof(Elf64_Sym));
 
 		for (i = 0; i < nsyms; i++) {
 			const Elf64_Sym *s = &syms[i];
@@ -450,7 +447,8 @@ static int process_file(const char *path, int opt_g, int opt_u, int opt_p, int o
 	return rc;
 }
 
-int __util_nm_main(int argc, char **argv)
+int __util_nm_main(
+	int argc, char **argv elements_withtok(null_terminated, argc))
 {
 	int i;
 	int opt_g = 0, opt_u = 0, opt_p = 0, opt_v = 0;
@@ -461,6 +459,12 @@ int __util_nm_main(int argc, char **argv)
 		char *a = argv[i];
 		char *p;
 
+		/* a[0] "not proven nonnull" is left open, same class as the
+		 * identical argv[i][0] access in du.c, cp.c, m4.c (see du.c's
+		 * comment). elements_withtok(null_terminated, argc) proves a
+		 * reachable NUL per element but carries no "pointer itself is
+		 * non-NULL" qualifier, so AggregateElementToken has nothing to
+		 * hand ValidPointer here. No annotation closes this. */
 		if (a[0] != '-' || a[1] == 0) break;
 		if (!strcmp(a, "--")) { i++; break; }
 		for (p = a + 1; *p; p++) {

@@ -24,7 +24,7 @@
  * file in this directory already uses for "a genuinely separate crashed
  * process", so there is no reason for this one to invent a second way).
  *
- * Two shapes per fault, both required by this change's own plan:
+ * Two shapes per fault:
  *
  *   - DEFAULT disposition (no handler installed): the child must
  *     actually die from the real signal, and the PARENT's waitpid()
@@ -45,9 +45,7 @@
  *     lived to return normally" apart from the one true positive.
  *
  * SIGFPE deliberately does NOT use integer division by zero, unlike the
- * common x86 idiom (and unlike this project's own plan document, which
- * named it as the expected mechanism before this file was written and
- * this was checked against the real hardware): AArch64's SDIV/UDIV
+ * common x86 idiom: AArch64's SDIV/UDIV
  * instructions do not trap on division by zero at all -- the ISA defines
  * the result as a silent 0, full stop, confirmed empirically on this
  * exact host (`volatile int c = 1/0;` under real clang -O0 here prints
@@ -60,9 +58,7 @@
  * (architecturally optional on AArch64; some cores wire the FPCR xxE
  * bits RES0 and never trap at all -- confirmed NOT the case here), and
  * the resulting real SIGFPE carries si_code FPE_FLTDIV, matching
- * signal.h's own FPE_FLTDIV value. This is exactly the "or an
- * feenableexcept-style FP trap" alternative this change's own plan
- * document names for precisely this reason.
+ * signal.h's own FPE_FLTDIV value.
  */
 #define _GNU_SOURCE
 #include <unistd.h>
@@ -119,16 +115,28 @@ static int child_segv_handler(void)
 	return 91;   /* handler_segv() should already have _exit()'d */
 }
 
-/* .word 0xffffffff: AArch64 has no single canonical "undefined
- * instruction" mnemonic the way x86 has ud2, but 0xffffffff is not a
- * valid encoding of any real AArch64 instruction (every real encoding
- * reserves bit patterns this one does not match), confirmed empirically
- * on this host to raise a real SIGILL with si_code ILL_ILLOPC -- not
- * merely assumed from the ISA reference. */
+/* AArch64 has no single canonical "undefined instruction" mnemonic the
+ * way x86 has ud2, so .word 0xffffffff is used instead: not a valid
+ * encoding of any real AArch64 instruction (every real encoding reserves
+ * bit patterns this one does not match), confirmed empirically on this
+ * host to raise a real SIGILL with si_code ILL_ILLOPC -- not merely
+ * assumed from the ISA reference. GNU as's .word is architecture-width
+ * (4 bytes on AArch64, but only 2 on x86_64), so the same directive is
+ * not portable between the two arches this file's asan CI leg targets;
+ * x86_64 uses its own canonical ud2 instead. */
+#if defined(__aarch64__)
 static void trap_illegal_instruction(void)
 {
 	__asm__ volatile(".word 0xffffffff");
 }
+#elif defined(__x86_64__)
+static void trap_illegal_instruction(void)
+{
+	__asm__ volatile("ud2");
+}
+#else
+#error "trap_illegal_instruction: unsupported architecture"
+#endif
 
 static void handler_ill(int sig, siginfo_t *si, void *uc)
 {

@@ -12,10 +12,10 @@
  * still-open, non-close-on-exec descriptor automatically, with the
  * kernel as the only bookkeeping authority for the raw numbers.
  *
- * What IS this library's own job: ntlibc's own __fds[] table in a
+ * What IS this library's own job: spicule's own __fds[] table in a
  * freshly exec'd process is a brand new, zeroed array that has never
  * heard of any of these descriptors. A raw descriptor surviving exec is
- * perfectly usable at the syscall level, but every ntlibc-level
+ * perfectly usable at the syscall level, but every spicule-level
  * operation on it (read()/write()/fcntl()/close()/dup(), which resolve a
  * small integer to a handle by indexing __fds[], never by asking the
  * kernel) returns EBADF until the table knows the slot is occupied.
@@ -41,7 +41,7 @@
  * NtQueryVolumeInformationFile/NtQueryInformationFile pair there, a
  * single statx(2) here). */
 
-/* This translation unit implements ntlibc's freestanding -nostdinc
+/* This translation unit implements spicule's freestanding -nostdinc
  * public-header contract; transitive ABI declarations are intentional,
  * so hosted include ownership and unused-include advice do not apply. */
 // NOLINTBEGIN(misc-include-cleaner)
@@ -49,6 +49,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include "libc.h"
+#include "unsafe_pointer.h"
 
 #if defined(__aarch64__)
 #define SYS_statx 291
@@ -205,7 +206,10 @@ static void install_std(int fd)
 	 * for fd 0, O_WRONLY for 1/2: write() refuses an O_RDONLY descriptor
 	 * and O_RDONLY is 0, so getting this wrong for an inherited
 	 * stdout/stderr would silently break writes to it. */
-	__fd_install_at(fd, (HANDLE)(long)(fd + 1), fd == 0 ? O_RDONLY : O_WRONLY, type);
+	/* Boxing, not dereference -- see install_inherited()'s own comment
+	 * below on the identical +1 HANDLE encoding. */
+	__fd_install_at(fd, unsafe_assume_valid_pointer((HANDLE)(long)(fd + 1)),
+	                fd == 0 ? O_RDONLY : O_WRONLY, type);
 }
 
 /* Every descriptor above 2 that is still open when a freshly exec'd
@@ -238,7 +242,17 @@ static void install_inherited(void)
 		flags = is_sys_error(flflags) ? 0 : ((unsigned)flflags & (O_ACCMODE | O_APPEND | O_NONBLOCK));
 		if (fdflags & FD_CLOEXEC_LX) flags |= O_CLOEXEC; /* should not happen (see banner) -- recorded faithfully if it somehow does */
 
-		__fd_install_at(fd, (HANDLE)(long)(fd + 1), flags, type);
+		/* This is the same "+1" fd-to-HANDLE boxing __plat_dup_to()
+		 * (src/unistd/linux/plat_fd.c), __plat_kill_open()'s box_fd(),
+		 * and every other Linux __plat_handle_t producer already use:
+		 * HANDLE/__plat_handle_t is void*
+		 * only because plat_handle.h commits every backend to one
+		 * pointer-sized carrier, never dereferenced on this backend --
+		 * the real payload is the plain descriptor number `fd`, which
+		 * this loop's own `for (fd = 3; fd < FD_MAX; fd++)` bounds to
+		 * a small nonnegative int, boxed +1 so 0 stays free for
+		 * __PLAT_HANDLE_NULL. */
+		__fd_install_at(fd, unsafe_assume_valid_pointer((HANDLE)(long)(fd + 1)), flags, type);
 	}
 }
 

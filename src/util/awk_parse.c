@@ -39,14 +39,50 @@
 #include <string.h>
 #include <stdio.h>
 #include "awk_priv.h"
+#include "ownership_stubs.h"
 #include "util.h"
 
+/* Every caller below treats a call to this as terminal (checks `if (!x)
+ * oom();` and relies on x being non-null immediately after) -- true
+ * because awk_unwind_fatal() itself is __attribute__((noreturn)) and,
+ * per its own awk_priv.h comment, unconditionally either longjmp()s out
+ * or falls back to diagnostic-plus-exit(2), never returning to this
+ * call site either way. Declaring oom() noreturn too just makes that
+ * already-true fact visible to the analyzer at every one of this file's
+ * `if (!x) oom();` sites, instead of leaving it to infer via inlining. */
+static void oom(void) __attribute__((noreturn));
 static void oom(void)
 {
 	__util_diagf("awk: out of memory\n");
 	awk_unwind_fatal();
 }
 
+/* Always returns a fresh, zeroed node: the only failure path is
+ * calloc() returning NULL, which oom() (now itself noreturn, see above)
+ * never returns from.
+ *
+ * Deliberately not given a withtok(heap_allocated)/dynamic_storage
+ * family: every node this allocates becomes part of the parsed
+ * program's AST, which src/util/awk.c's own __util_awk_main() (see its
+ * "deliberately never freed" comment there) and this project's whole
+ * fatal-unwind design (awk_priv.h's own header comment) already treat
+ * as intentionally outliving this translation unit's own tracking --
+ * a short-lived CLI process (or one bi_awk() shell built-in
+ * invocation) the OS reclaims at exit either way. Declaring a family
+ * anyway was tried and reverted: it does not change that nothing ever
+ * frees these nodes, so AllocationLifetimeChecker's own "not freed
+ * before exit" rule fires at every single mknode() call site and
+ * every struct awk_node/awk_func/awk_rule/awk_program owning pointer
+ * in between (8 findings -> 51, confirmed empirically), trading one
+ * honestly-disclosed, already-documented design tradeoff for a much
+ * larger and noisier one. The 8 "no dynamic-storage token contract"/
+ * "not freed before function exit" findings this file's own allocator
+ * sites (mknode(), addlist(), the T_ERE regex_t, parse_in()'s
+ * single-element list, parse_function_def()/parse_rule()'s own
+ * program-array growth, and awk_parse_program()'s own top-level
+ * calloc()) still produce are exactly that already-accepted tradeoff,
+ * left open rather than guessed at. */
+static struct awk_node *mknode(enum awk_ntype type) __attribute__((returns_nonnull));
 static struct awk_node *mknode(enum awk_ntype type)
 {
 	struct awk_node *n = calloc(1, sizeof *n);
@@ -55,9 +91,14 @@ static struct awk_node *mknode(enum awk_ntype type)
 	return n;
 }
 
+/* list/n are always &-of-a-local (every call site below passes
+ * &list, &cnt or the like); item is always a just-parsed node, and
+ * every parse_*() production in this file returns non-null (see
+ * mknode()'s own comment). */
+static void addlist(struct awk_node ***list, int *n, struct awk_node *item) __attribute__((nonnull(1, 2, 3)));
 static void addlist(struct awk_node ***list, int *n, struct awk_node *item)
 {
-	struct awk_node **g = realloc(*list, (size_t)(*n + 1) * sizeof **list);
+	struct awk_node **g = __util_reallocarray(*list, (size_t)*n + 1, sizeof **list); // NOLINT(bugprone-sizeof-expression) -- list is awk_node***, **list is awk_node*, the array holds pointers
 	if (!g) oom();
 	*list = g;
 	(*list)[*n] = item;
@@ -66,6 +107,9 @@ static void addlist(struct awk_node ***list, int *n, struct awk_node *item)
 
 /* ==== token stream plumbing ============================================= */
 
+/* Always called with &p->tok/&p->tok2/&p.tok -- the address of an
+ * actual struct awk_token, never null. */
+static void free_tok_text(struct awk_token *t) __attribute__((nonnull(1)));
 static void free_tok_text(struct awk_token *t)
 {
 	switch (t->type) {
@@ -77,6 +121,9 @@ static void free_tok_text(struct awk_token *t)
 	}
 }
 
+/* p is always the one struct awk_parser this whole file threads
+ * through (never null); out is always &p->tok/&p->tok2/&p.tok. */
+static void raw_next(struct awk_parser *p, struct awk_token *out) __attribute__((nonnull(1, 2)));
 static void raw_next(struct awk_parser *p, struct awk_token *out)
 {
 	if (awk_lex_next(&p->lx, out) < 0) {
@@ -88,6 +135,7 @@ static void raw_next(struct awk_parser *p, struct awk_token *out)
 	}
 }
 
+static void advance(struct awk_parser *p) __attribute__((nonnull(1)));
 static void advance(struct awk_parser *p)
 {
 	free_tok_text(&p->tok);
@@ -99,6 +147,7 @@ static void advance(struct awk_parser *p)
 	}
 }
 
+static enum awk_toktype peek2(struct awk_parser *p) __attribute__((nonnull(1)));
 static enum awk_toktype peek2(struct awk_parser *p)
 {
 	if (!p->has_tok2) {
@@ -108,6 +157,9 @@ static enum awk_toktype peek2(struct awk_parser *p)
 	return p->tok2.type;
 }
 
+/* msg is always a string literal or a local snprintf()-filled buffer,
+ * never null. */
+static void perr(struct awk_parser *p, const char *msg) __attribute__((nonnull(1, 2)));
 static void perr(struct awk_parser *p, const char *msg)
 {
 	if (p->err) return;
@@ -115,8 +167,10 @@ static void perr(struct awk_parser *p, const char *msg)
 	snprintf(p->errmsg, sizeof p->errmsg, "%s", msg);
 }
 
+static int at(struct awk_parser *p, enum awk_toktype t) __attribute__((nonnull(1)));
 static int at(struct awk_parser *p, enum awk_toktype t) { return p->tok.type == t; }
 
+static int accept_tok(struct awk_parser *p, enum awk_toktype t) __attribute__((nonnull(1)));
 static int accept_tok(struct awk_parser *p, enum awk_toktype t)
 {
 	if (p->tok.type != t) return 0;
@@ -124,6 +178,8 @@ static int accept_tok(struct awk_parser *p, enum awk_toktype t)
 	return 1;
 }
 
+/* what is always a string literal at every call site below. */
+static void expect(struct awk_parser *p, enum awk_toktype t, const char *what) __attribute__((nonnull(1, 3)));
 static void expect(struct awk_parser *p, enum awk_toktype t, const char *what)
 {
 	if (p->err) return;
@@ -137,28 +193,108 @@ static void expect(struct awk_parser *p, enum awk_toktype t, const char *what)
 }
 
 /* `opt_nls` -- see awk_priv.h's struct awk_lexer comment. */
+static void skip_newlines(struct awk_parser *p) __attribute__((nonnull(1)));
 static void skip_newlines(struct awk_parser *p)
 {
 	while (at(p, T_NEWLINE)) advance(p);
 }
 
+static void skip_terminators(struct awk_parser *p) __attribute__((nonnull(1)));
 static void skip_terminators(struct awk_parser *p)
 {
 	while (at(p, T_NEWLINE) || at(p, T_SEMI)) advance(p);
 }
 
+/* ==== recursion depth guard =============================================
+ *
+ * This parser has no depth limit on the awk program text itself: a
+ * source file is fully attacker-controlled input (a script handed to
+ * awk(1p)), and every one of parse_stmt()/parse_primary()/parse_pow()/
+ * parse_ternary()/parse_assign() is mutually or directly self-recursive
+ * with no base case other than running out of matching tokens. A
+ * pathological-but-trivially-constructed program -- a run of N `(`
+ * characters, N unary `-`/`!` operators, N `$` indirections, an N-deep
+ * `a?a:a?a:...` ternary chain, an N-deep `a=a=...=1` assignment chain,
+ * or N nested `{` blocks -- recurses this parser's own C stack N levels
+ * deep with no other bound, which is a real stack-overflow crash (not a
+ * clean parse error) for a large enough N. Every one of those five
+ * shapes is a genuine, unbounded, attacker-reachable recursion vector:
+ * XCU awk(1p) sets no nesting limit, but this implementation has to,
+ * the same way any recursive-descent parser accepting untrusted text
+ * does.
+ *
+ * AWK_PARSE_MAX_DEPTH is deliberately conservative (not tuned to any
+ * one platform's default stack size): each of the five guarded
+ * productions above is only ONE of several stack frames a single
+ * nesting level actually costs (e.g. one `(` costs a frame in every
+ * function between parse_primary() and parse_primary() again --
+ * parse_paren_group(), parse_expr(), parse_assign(), parse_ternary(),
+ * parse_or(), parse_and(), parse_in(), parse_match(), parse_rel(),
+ * parse_concat(), parse_additive(), parse_mul(), parse_unary(),
+ * parse_pow() -- most of which are NOT separately guarded because they
+ * are not themselves recursive; guarding the five that ARE keeps this
+ * count proportional to real stack depth without needing to instrument
+ * every production). 200 levels is far beyond any awk program a person
+ * would write or a code generator would sanely emit, while staying
+ * comfortably inside even a constrained (e.g. 1 MiB) C stack at this
+ * project's typical per-frame cost.
+ *
+ * p->depth is one shared counter, not five separate ones: these five
+ * productions can recurse into EACH OTHER (an lvalue's own `(` opens a
+ * fresh parse_ternary/parse_assign chain, etc.), so what actually needs
+ * bounding is their combined live nesting, not any one production's
+ * count in isolation. */
+#define AWK_PARSE_MAX_DEPTH 200
+
+/* Call at the top of a guarded production, before it does any of its
+ * own (potentially self-recursive) parsing. Returns 1 and bumps
+ * p->depth on success; on exceeding the limit, sets a parse error and
+ * returns 0 -- callers must not recurse further in that case, just
+ * return a harmless placeholder node so the C stack unwinds instead of
+ * growing past the point that already tripped this guard. Paired with
+ * parse_depth_leave(), called unconditionally on every return path
+ * (including the guard's own reject case, which counts itself back out
+ * before returning, so a caller that checks the return value need not). */
+static int parse_depth_enter(struct awk_parser *p) __attribute__((nonnull(1)));
+static int parse_depth_enter(struct awk_parser *p)
+{
+	if (++p->depth > AWK_PARSE_MAX_DEPTH) {
+		p->depth--;
+		perr(p, "awk: expression or statement nested too deeply");
+		return 0;
+	}
+	return 1;
+}
+
+static void parse_depth_leave(struct awk_parser *p) __attribute__((nonnull(1)));
+static void parse_depth_leave(struct awk_parser *p) { p->depth--; }
+
 /* ==== expression grammar ================================================= */
 
-static struct awk_node *parse_expr(struct awk_parser *p);
-static struct awk_node *parse_ternary(struct awk_parser *p);
-static struct awk_node *parse_unary(struct awk_parser *p);
-static struct awk_node *parse_concat(struct awk_parser *p);
-static struct awk_node *parse_primary(struct awk_parser *p);
-static struct awk_node *parse_lvalue_from_primary(struct awk_parser *p, struct awk_node *n);
-static struct awk_node *parse_stmt(struct awk_parser *p);
-static struct awk_node *parse_block(struct awk_parser *p);
-static struct awk_node **parse_expr_list(struct awk_parser *p, int *n, int allow_empty);
+/* Every one of these mutually-recursive productions is only ever
+ * called with p == this file's one live struct awk_parser (never
+ * null), and -- other than parse_expr_list(), which explicitly returns
+ * NULL for an empty optional list (see its own comment) -- always
+ * returns a real node: every return statement in each production's
+ * body is either mknode(...) itself (returns_nonnull, see mknode()'s
+ * own comment) or another one of these same always-non-null
+ * productions. */
+static struct awk_node *parse_expr(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
+static struct awk_node *parse_assign(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
+static struct awk_node *parse_ternary(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
+static struct awk_node *parse_unary(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
+static struct awk_node *parse_concat(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
+static struct awk_node *parse_primary(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
+static struct awk_node *parse_lvalue_from_primary(struct awk_parser *p, struct awk_node *n) __attribute__((nonnull(1, 2), returns_nonnull));
+static struct awk_node *parse_stmt(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
+static struct awk_node *parse_block(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
+static struct awk_node **parse_expr_list(struct awk_parser *p, int *n, int allow_empty) __attribute__((nonnull(1, 2)));
 
+/* n is always a just-parsed, non-null node (parse_unary()/
+ * parse_primary()'s own result, or a plain passthrough of one -- see
+ * mknode()'s own comment for why every production's return is
+ * non-null). */
+static int is_lvalue(struct awk_node *n) __attribute__((nonnull(1)));
 static int is_lvalue(struct awk_node *n)
 {
 	return n->type == N_VAR || n->type == N_FIELD || n->type == N_ARRIDX;
@@ -175,6 +311,7 @@ static int is_lvalue(struct awk_node *n)
  * would inside a function call's argument list or an array
  * subscript's brackets (parse_expr_list() below does the same
  * save/clear/restore for those two). */
+static struct awk_node *parse_paren_group(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
 static struct awk_node *parse_paren_group(struct awk_parser *p)
 {
 	struct awk_node **list = NULL;
@@ -201,6 +338,10 @@ static struct awk_node *parse_paren_group(struct awk_parser *p)
 	}
 }
 
+/* cmd_or_null is deliberately nullable (GL_MAIN/GL_FILE's own callers
+ * pass NULL -- only GL_CMD's `expr | getline` form has a real command
+ * expression to attach). */
+static struct awk_node *parse_getline(struct awk_parser *p, struct awk_node *cmd_or_null, enum awk_getline_src src) __attribute__((nonnull(1), returns_nonnull));
 static struct awk_node *parse_getline(struct awk_parser *p, struct awk_node *cmd_or_null, enum awk_getline_src src)
 {
 	struct awk_node *g = mknode(N_GETLINE);
@@ -225,7 +366,7 @@ static struct awk_node *parse_getline(struct awk_parser *p, struct awk_node *cmd
  * accept concatenation (`"dir/" name`) but not relational/`in`/&&/||
  * -- i.e. the same "concat and tighter" tier used for print's own
  * redirection target. */
-static struct awk_node *parse_primary(struct awk_parser *p)
+static struct awk_node *parse_primary_impl(struct awk_parser *p)
 {
 	struct awk_node *n;
 
@@ -304,6 +445,12 @@ static struct awk_node *parse_primary(struct awk_parser *p)
 	case T_BUILTIN_NAME: {
 		char *name = p->tok.text; p->tok.text = NULL;
 		int had_lparen = p->tok.adj_lparen;
+		/* struct awk_token.text is withtok(null_terminated), but that
+		 * fact does not survive crossing into this plain `char *name`
+		 * local -- restated here the same way expr.c/test.c/find.c's
+		 * own header comments document for an argv-derived element
+		 * crossing the same boundary. */
+		unsafe_assume_string_terminated(name);
 		advance(p);
 		n = mknode(N_CALL);
 		n->str = name;
@@ -365,6 +512,19 @@ postfix:
 	return n;
 }
 
+/* Guarded per this file's own "recursion depth guard" section above:
+ * parse_primary_impl() is the one production every unbounded expression-
+ * nesting shape (parens, prefix +/-/!/++/--, `$` chains, function-call/
+ * subscript argument lists) recurses back through. */
+static struct awk_node *parse_primary(struct awk_parser *p)
+{
+	struct awk_node *n;
+	if (!parse_depth_enter(p)) return mknode(N_NUM);
+	n = parse_primary_impl(p);
+	parse_depth_leave(p);
+	return n;
+}
+
 /* After parse_primary() has already produced `n` (used by getline's
  * optional lvalue target, which parses one primary and must reject a
  * non-lvalue result rather than re-deriving it). */
@@ -374,7 +534,8 @@ static struct awk_node *parse_lvalue_from_primary(struct awk_parser *p, struct a
 	return n;
 }
 
-static struct awk_node *parse_pow(struct awk_parser *p)
+static struct awk_node *parse_pow_impl(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
+static struct awk_node *parse_pow_impl(struct awk_parser *p)
 {
 	struct awk_node *l = parse_primary(p);
 	if (at(p, T_CARET)) {
@@ -389,6 +550,20 @@ static struct awk_node *parse_pow(struct awk_parser *p)
 	return l;
 }
 
+/* Guarded: `^`'s own right-associativity makes parse_pow() indirectly
+ * self-recursive (via parse_unary()) for a chain like `2^2^2^...` --
+ * see this file's "recursion depth guard" section above. */
+static struct awk_node *parse_pow(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
+static struct awk_node *parse_pow(struct awk_parser *p)
+{
+	struct awk_node *n;
+	if (!parse_depth_enter(p)) return mknode(N_NUM);
+	n = parse_pow_impl(p);
+	parse_depth_leave(p);
+	return n;
+}
+
+static struct awk_node *parse_unary(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
 static struct awk_node *parse_unary(struct awk_parser *p)
 {
 	/* Unary +/-/! are already parse_primary()'s own cases (so that
@@ -398,6 +573,7 @@ static struct awk_node *parse_unary(struct awk_parser *p)
 	return parse_pow(p);
 }
 
+static struct awk_node *parse_mul(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
 static struct awk_node *parse_mul(struct awk_parser *p)
 {
 	struct awk_node *l = parse_unary(p);
@@ -418,6 +594,7 @@ static struct awk_node *parse_mul(struct awk_parser *p)
 	return l;
 }
 
+static struct awk_node *parse_additive(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
 static struct awk_node *parse_additive(struct awk_parser *p)
 {
 	struct awk_node *l = parse_mul(p);
@@ -437,6 +614,7 @@ static struct awk_node *parse_additive(struct awk_parser *p)
 	return l;
 }
 
+static int starts_concat_operand(struct awk_parser *p) __attribute__((nonnull(1)));
 static int starts_concat_operand(struct awk_parser *p)
 {
 	switch (p->tok.type) {
@@ -461,6 +639,7 @@ static struct awk_node *parse_concat(struct awk_parser *p)
 	return l;
 }
 
+static struct awk_node *parse_rel(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
 static struct awk_node *parse_rel(struct awk_parser *p)
 {
 	struct awk_node *l = parse_concat(p);
@@ -492,6 +671,7 @@ static struct awk_node *parse_rel(struct awk_parser *p)
 	return l;
 }
 
+static struct awk_node *parse_match(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
 static struct awk_node *parse_match(struct awk_parser *p)
 {
 	struct awk_node *l = parse_rel(p);
@@ -507,6 +687,7 @@ static struct awk_node *parse_match(struct awk_parser *p)
 	return l;
 }
 
+static struct awk_node *parse_in(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
 static struct awk_node *parse_in(struct awk_parser *p)
 {
 	struct awk_node *l = parse_match(p);
@@ -520,12 +701,13 @@ static struct awk_node *parse_in(struct awk_parser *p)
 		in = mknode(N_IN);
 		in->str = arrname;
 		if (l->type == N_ELIST) { in->list = l->list; in->nlist = l->nlist; free(l); }
-		else { in->list = malloc(sizeof *in->list); if (!in->list) oom(); in->list[0] = l; in->nlist = 1; }
+		else { in->list = malloc(sizeof *in->list); if (!in->list) oom(); in->list[0] = l; in->nlist = 1; } // NOLINT(bugprone-sizeof-expression) -- list is awk_node**, *list is awk_node*, the array holds pointers
 		l = in;
 	}
 	return l;
 }
 
+static struct awk_node *parse_and(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
 static struct awk_node *parse_and(struct awk_parser *p)
 {
 	struct awk_node *l = parse_in(p);
@@ -540,6 +722,7 @@ static struct awk_node *parse_and(struct awk_parser *p)
 	return l;
 }
 
+static struct awk_node *parse_or(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
 static struct awk_node *parse_or(struct awk_parser *p)
 {
 	struct awk_node *l = parse_and(p);
@@ -554,7 +737,8 @@ static struct awk_node *parse_or(struct awk_parser *p)
 	return l;
 }
 
-static struct awk_node *parse_ternary(struct awk_parser *p)
+static struct awk_node *parse_ternary_impl(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
+static struct awk_node *parse_ternary_impl(struct awk_parser *p)
 {
 	struct awk_node *c = parse_or(p);
 	if (at(p, T_QUESTION)) {
@@ -573,9 +757,26 @@ static struct awk_node *parse_ternary(struct awk_parser *p)
 	return c;
 }
 
-static const int assign_ops[] = { T_ASSIGN, T_ADD_ASSIGN, T_SUB_ASSIGN, T_MUL_ASSIGN, T_DIV_ASSIGN, T_MOD_ASSIGN, T_POW_ASSIGN, 0 };
+/* Guarded: `?:`'s right-associativity makes this self-recursive (twice
+ * over, for the true- and false-branches) for a chain like
+ * `a?a?a?...:b:b:b` -- see this file's "recursion depth guard" section
+ * above. */
+static struct awk_node *parse_ternary(struct awk_parser *p)
+{
+	struct awk_node *n;
+	if (!parse_depth_enter(p)) return mknode(N_NUM);
+	n = parse_ternary_impl(p);
+	parse_depth_leave(p);
+	return n;
+}
 
-static struct awk_node *parse_assign(struct awk_parser *p)
+/* enum awk_toktype, not int: p->tok.type below is compared against these
+ * entries directly, and the terminating 0 is T_EOF (never a real assign
+ * operator), so the array's own element type should be the enum it holds. */
+static const enum awk_toktype assign_ops[] = { T_ASSIGN, T_ADD_ASSIGN, T_SUB_ASSIGN, T_MUL_ASSIGN, T_DIV_ASSIGN, T_MOD_ASSIGN, T_POW_ASSIGN, T_EOF };
+
+static struct awk_node *parse_assign_impl(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
+static struct awk_node *parse_assign_impl(struct awk_parser *p)
 {
 	struct awk_node *l = parse_ternary(p);
 	int i, op = 0;
@@ -592,6 +793,18 @@ static struct awk_node *parse_assign(struct awk_parser *p)
 		return n;
 	}
 	return l;
+}
+
+/* Guarded: assignment's own right-associativity makes this self-
+ * recursive for a chain like `a=a=a=...=1` -- see this file's
+ * "recursion depth guard" section above. */
+static struct awk_node *parse_assign(struct awk_parser *p)
+{
+	struct awk_node *n;
+	if (!parse_depth_enter(p)) return mknode(N_NUM);
+	n = parse_assign_impl(p);
+	parse_depth_leave(p);
+	return n;
 }
 
 static struct awk_node *parse_expr(struct awk_parser *p)
@@ -624,6 +837,7 @@ static struct awk_node **parse_expr_list(struct awk_parser *p, int *n, int allow
 
 /* ==== print / printf ====================================================== */
 
+static struct awk_node *parse_print_expr(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
 static struct awk_node *parse_print_expr(struct awk_parser *p)
 {
 	struct awk_node *n;
@@ -633,6 +847,7 @@ static struct awk_node *parse_print_expr(struct awk_parser *p)
 	return n;
 }
 
+static struct awk_node *parse_print_stmt(struct awk_parser *p, int is_printf) __attribute__((nonnull(1), returns_nonnull));
 static struct awk_node *parse_print_stmt(struct awk_parser *p, int is_printf)
 {
 	struct awk_node *n = mknode(is_printf ? N_PRINTF : N_PRINT);
@@ -666,13 +881,15 @@ static struct awk_node *parse_print_stmt(struct awk_parser *p, int is_printf)
 
 /* ==== statements ========================================================== */
 
+static struct awk_node *parse_simple_or_null(struct awk_parser *p) __attribute__((nonnull(1)));
 static struct awk_node *parse_simple_or_null(struct awk_parser *p)
 {
 	if (at(p, T_SEMI) || at(p, T_RPAREN)) return NULL;
 	return parse_stmt(p);
 }
 
-static struct awk_node *parse_stmt(struct awk_parser *p)
+static struct awk_node *parse_stmt_impl(struct awk_parser *p) __attribute__((nonnull(1), returns_nonnull));
+static struct awk_node *parse_stmt_impl(struct awk_parser *p)
 {
 	if (p->err) return mknode(N_BLOCK);
 
@@ -793,6 +1010,20 @@ static struct awk_node *parse_stmt(struct awk_parser *p)
 	}
 }
 
+/* Guarded: statement nesting (if/while/for/do bodies, and -- the one
+ * shape with no expression of its own to already be guarded via
+ * parse_primary() -- a run of N bare `{` blocks, `{{{...}}}`) recurses
+ * through parse_stmt() <-> parse_block() with no other bound. See this
+ * file's "recursion depth guard" section above. */
+static struct awk_node *parse_stmt(struct awk_parser *p)
+{
+	struct awk_node *n;
+	if (!parse_depth_enter(p)) return mknode(N_BLOCK);
+	n = parse_stmt_impl(p);
+	parse_depth_leave(p);
+	return n;
+}
+
 static struct awk_node *parse_block(struct awk_parser *p)
 {
 	struct awk_node *n = mknode(N_BLOCK);
@@ -812,6 +1043,7 @@ static struct awk_node *parse_block(struct awk_parser *p)
 
 /* ==== top level: functions and pattern-action rules ====================== */
 
+static void parse_function_def(struct awk_parser *p) __attribute__((nonnull(1)));
 static void parse_function_def(struct awk_parser *p)
 {
 	struct awk_func f;
@@ -828,7 +1060,7 @@ static void parse_function_def(struct awk_parser *p)
 		for (;;) {
 			if (!at(p, T_NAME)) { perr(p, "awk: expected parameter name"); break; }
 			{
-				char **g = realloc(params, (size_t)(nparams + 1) * sizeof *params);
+				char **g = __util_reallocarray(params, (size_t)nparams + 1, sizeof *params);
 				if (!g) oom();
 				params = g;
 				params[nparams++] = p->tok.text; p->tok.text = NULL;
@@ -844,13 +1076,20 @@ static void parse_function_def(struct awk_parser *p)
 	f.body = parse_block(p);
 
 	{
-		struct awk_func *g = realloc(p->prog->funcs, (size_t)(p->prog->nfuncs + 1) * sizeof *g);
+		/* p->prog is set exactly once, in awk_parse_program(), right
+		 * after a checked calloc() -- genuinely never NULL for this
+		 * parser's whole lifetime (see struct awk_parser's own
+		 * awk_priv.h comment), but that fact does not survive a struct
+		 * field read this per-function analysis cannot see through. */
+		unsafe_assume_pointer_nonnull(p->prog);
+		struct awk_func *g = __util_reallocarray(p->prog->funcs, (size_t)p->prog->nfuncs + 1, sizeof *g);
 		if (!g) oom();
 		p->prog->funcs = g;
 		p->prog->funcs[p->prog->nfuncs++] = f;
 	}
 }
 
+static void parse_rule(struct awk_parser *p) __attribute__((nonnull(1)));
 static void parse_rule(struct awk_parser *p)
 {
 	struct awk_rule r;
@@ -883,7 +1122,13 @@ static void parse_rule(struct awk_parser *p)
 	}
 
 	{
-		struct awk_rule *g = realloc(p->prog->rules, (size_t)(p->prog->nrules + 1) * sizeof *g);
+		/* p->prog is set exactly once, in awk_parse_program(), right
+		 * after a checked calloc() -- genuinely never NULL for this
+		 * parser's whole lifetime (see struct awk_parser's own
+		 * awk_priv.h comment), but that fact does not survive a struct
+		 * field read this per-function analysis cannot see through. */
+		unsafe_assume_pointer_nonnull(p->prog);
+		struct awk_rule *g = __util_reallocarray(p->prog->rules, (size_t)p->prog->nrules + 1, sizeof *g);
 		if (!g) oom();
 		p->prog->rules = g;
 		p->prog->rules[p->prog->nrules++] = r;

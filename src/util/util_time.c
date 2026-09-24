@@ -78,7 +78,7 @@
  *
  * "utility cannot be a special built-in" (OPERANDS): satisfied by
  * construction rather than by an explicit check. Unlike a shell's own
- * `time` reserved word (which ntlibc's sh does not implement -- only
+ * `time` reserved word (which spicule's sh does not implement -- only
  * this builtin), both callers of __util_time_main() -- bin/time.exe
  * and the `time` shell builtin -- always resolve `utility` via
  * __find_program() and run it as a real, separate process via
@@ -108,7 +108,8 @@ static double tv_diff(struct timeval a, struct timeval b)
 	return (double)(b.tv_sec - a.tv_sec) + (double)(b.tv_usec - a.tv_usec) / 1e6;
 }
 
-int __util_time_main(int argc, char **argv)
+int __util_time_main(
+	int argc, char **argv elements_withtok(null_terminated, argc))
 {
 	int i = 1;
 	char *resolved;

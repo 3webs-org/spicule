@@ -21,7 +21,7 @@
  * before anything else, including __fd_init().
  */
 
-/* This translation unit implements ntlibc's freestanding -nostdinc
+/* This translation unit implements spicule's freestanding -nostdinc
  * public-header contract; transitive ABI declarations are intentional,
  * so hosted include ownership and unused-include advice do not apply. */
 // NOLINTBEGIN(misc-include-cleaner)
@@ -31,6 +31,7 @@
 #include "libc.h"
 #include "plat_exit.h"
 #include "linux/tls.h"
+#include "unsafe_pointer.h"
 
 int main(int, char **, char **);
 
@@ -207,7 +208,13 @@ static struct elf_phdr *find_tls_phdr(long *auxv, unsigned long *load_bias_out)
 	 * guarantees AT_PHDR points to a real, mapped program header table
 	 * whenever it's present at all. */
 	for (i = 0; i < phnum; i++) {
-		struct elf_phdr *ph = (struct elf_phdr *)(phdr + i * phent);
+		/* phdr is AT_PHDR, straight out of the kernel-populated auxv --
+		 * the kernel's ELF auxv contract guarantees it points to a real,
+		 * mapped program header table whenever it's present at all
+		 * (checked above), not something this loop derives from a
+		 * pointer anywhere in this translation unit. */
+		struct elf_phdr *ph =
+		    unsafe_assume_valid_pointer((struct elf_phdr *)(phdr + i * phent));
 		if (ph->p_type == PT_TLS) tls = ph;
 		else if (ph->p_type == PT_PHDR) *load_bias_out = phdr - (unsigned long)ph->p_vaddr;
 	}
@@ -225,7 +232,7 @@ static struct elf_phdr *find_tls_phdr(long *auxv, unsigned long *load_bias_out)
  *
  * The dtv slot is real: src/dlfcn/linux/plat_dlfcn.c builds per-
  * dlopen()'d-object TLS on top of it, with module 1 reserved for the
- * main image (dtv[1] = tp, set inside __ntlibc_linux_tls_block_create()
+ * main image (dtv[1] = tp, set inside __spicule_linux_tls_block_create()
  * below).
  *
  * A TCB (with real DTV) is ALWAYS installed, even with no PT_TLS
@@ -236,13 +243,13 @@ static struct elf_phdr *find_tls_phdr(long *auxv, unsigned long *load_bias_out)
  *
  * The actual block construction (raw mmap() of the TCB+DTV, copying
  * PT_TLS's data in) lives in src/internal/linux/tls_setup.c's
- * __ntlibc_linux_tls_block_create(), not here: src/thread/linux/
+ * __spicule_linux_tls_block_create(), not here: src/thread/linux/
  * plat_thread.c's __plat_thread_spawn() needs to build the exact same
  * shape for every pthread_create()'d thread's own CLONE_SETTLS block,
  * and sharing the one real implementation rules out the two ever
  * silently drifting apart. This function's own job narrows to finding
  * PT_TLS (auxv is only ever available here, at process startup) and
- * publishing it through __ntlibc_linux_tls_layout for that shared
+ * publishing it through __spicule_linux_tls_layout for that shared
  * builder to read -- including from a later pthread_create() call, long
  * after auxv has gone out of scope. */
 static void linux_setup_tls(long *auxv)
@@ -251,12 +258,12 @@ static void linux_setup_tls(long *auxv)
 	struct elf_phdr *tls = find_tls_phdr(auxv, &load_bias);
 	void *tp;
 
-	__ntlibc_linux_tls_layout.vaddr = tls ? tls->p_vaddr + load_bias : 0;
-	__ntlibc_linux_tls_layout.filesz = tls ? tls->p_filesz : 0;
-	__ntlibc_linux_tls_layout.memsz = tls ? tls->p_memsz : 0;
-	__ntlibc_linux_tls_layout.align = tls ? tls->p_align : 0;
+	__spicule_linux_tls_layout.vaddr = tls ? tls->p_vaddr + load_bias : 0;
+	__spicule_linux_tls_layout.filesz = tls ? tls->p_filesz : 0;
+	__spicule_linux_tls_layout.memsz = tls ? tls->p_memsz : 0;
+	__spicule_linux_tls_layout.align = tls ? tls->p_align : 0;
 
-	tp = __ntlibc_linux_tls_block_create();
+	tp = __spicule_linux_tls_block_create();
 	if (!tp) return; /* bootstrap alloc failed -- leave TPIDR_EL0 unset */
 
 	__asm__ volatile("msr tpidr_el0, %0" : : "r"(tp) : "memory");
@@ -378,21 +385,37 @@ static void linux_setup_tls(long *auxv)
 /* Builds this library's own, independently-owned copy of the initial
  * environment (see this file's top banner for why aliasing envp in
  * place is a real, confirmed bug). __malloc()/__free(), not
- * malloc()/free(): this runs before __fd_init(). */
-static char **linux_build_environ(char **envp) __attribute__((nonnull(1)));
-static char **linux_build_environ(char **envp)
+ * malloc()/free(): this runs before __fd_init().
+ *
+ * count is the caller's own responsibility, exactly the way argc is for
+ * every argc/argv-shaped utility entry point in src/internal/util.h --
+ * the NUL-scan that discovers it happens once, at the call site, so
+ * elements_withtok(null_terminated, count) below can name a parameter
+ * the caller already proved, instead of a length this function would
+ * otherwise have to discover on its own with no way to state the result. */
+static char **linux_build_environ(
+	char **envp elements_withtok(null_terminated, count), size_t count)
+	__attribute__((nonnull(1)));
+static char **linux_build_environ(
+	char **envp elements_withtok(null_terminated, count), size_t count)
 {
-	size_t count = 0, i;
+	size_t i, evbytes, added;
 	char **ev;
 
-	while (envp[count]) count++;
-
-	ev = (char **)__malloc(sizeof(char *) * (count + 1));
+	if (!__size_add_checked(count, 1, &added) ||
+	    !__size_mul_checked(added, sizeof(char *), &evbytes)) return 0;
+	ev = (char **)__malloc(evbytes);
 	if (!ev) return 0;
 
 	for (i = 0; i < count; i++) {
 		size_t len = strlen(envp[i]);
-		char *s = (char *)__malloc(len + 1);
+		size_t bytes;
+		char *s;
+		if (!__size_add_checked(len, 1, &bytes)) {
+			__free(ev);
+			return 0;
+		}
+		s = (char *)__malloc(bytes);
 		if (!s) {
 			while (i > 0) __free(ev[--i]);
 			__free(ev);
@@ -417,6 +440,7 @@ _Noreturn void __linux_start_main(long *sp)
 	char **argv = (char **)(sp + 1);
 	char **envp = argv + argc + 1;
 	long *auxv = (long *)envp;
+	size_t envc = 0;
 	char *slash;
 	int rc;
 
@@ -428,7 +452,7 @@ _Noreturn void __linux_start_main(long *sp)
 	 * real exit(3) value or a signal-death encoding (128+n). */
 	if (!__verify_ldbl_layout()) {
 		static const char msg[] =
-			"ntlibc: long double bit-layout assumption failed at startup\n";
+			"spicule: long double bit-layout assumption failed at startup\n";
 		raw_syscall(SYS_write, 2, (long)msg, sizeof msg - 1, 0, 0, 0);
 		__plat_terminate(111);
 	}
@@ -442,10 +466,11 @@ _Noreturn void __linux_start_main(long *sp)
 
 	__argc = (int)argc;
 	__argv = argv;
-	environ = linux_build_environ(envp);
+	while (envp[envc]) envc++;
+	environ = linux_build_environ(envp, envc);
 	if (!environ) {
 		static const char msg[] =
-			"ntlibc: out of memory building environ at startup\n";
+			"spicule: out of memory building environ at startup\n";
 		raw_syscall(SYS_write, 2, (long)msg, sizeof msg - 1, 0, 0, 0);
 		__plat_terminate(111);
 	}

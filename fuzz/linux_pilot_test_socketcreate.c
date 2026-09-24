@@ -1,11 +1,11 @@
 /* SPDX-FileCopyrightText: (C) 2026 Gavin John
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Linux socket-CREATION pilot smoke test -- NOT part of ntlibc, same
+ * Linux socket-CREATION pilot smoke test -- NOT part of spicule, same
  * standing as fuzz/linux_pilot_test.c and fuzz/linux_pilot_test_socket.c
  * (the earlier recv()/send()-only pilot).
  *
- * Exercises the REAL ntlibc public entry points socket()/bind()/listen()/
+ * Exercises the REAL spicule public entry points socket()/bind()/listen()/
  * connect()/accept()/send()/recv() (src/socket/{socket,bind,connect,
  * listen,accept,sendrecv}.c, statically linked here, unmodified) against
  * the new src/socket/linux/plat_socket.c backend, running as a real,
@@ -18,7 +18,8 @@
  * bind() lets the kernel choose one -- then getsockname()'s absence from
  * this pilot's link set is worked around by using a fixed high port
  * instead, retried if already in use, since getsockname() is not one of
- * the five front doors this task ports).  A second socket connect()s to
+ * the five socket-creation front doors this pilot links).  A second
+ * socket connect()s to
  * it. Because both sockets are real kernel TCP sockets on loopback with a
  * backlog already installed, connect() completes as soon as the kernel's
  * SYN queue accepts the handshake -- it does NOT need accept() to have
@@ -42,10 +43,9 @@ static int failures;
 	if (!(cond)) { printf("FAIL - %s (errno=%d)\n", msg, errno); failures++; } \
 } while (0)
 
-/* A fixed high port, retried on EADDRINUSE: this pilot's link set has no
- * getsockname() (out of the five socket-creation front doors this task
- * ports), so binding to port 0 and discovering the kernel's chosen port
- * is not available here the way a full program could do it. */
+/* A fixed high port, retried on EADDRINUSE -- see this file's own banner
+ * for why getsockname() is not available to discover the kernel's
+ * choice instead. */
 #define BASE_PORT 58231
 #define PORT_TRIES 8
 
@@ -57,7 +57,7 @@ int main(void)
 	struct sockaddr_in addr;
 	struct sockaddr_in peer;
 	socklen_t peerlen;
-	const char msg1[] = "hello from a real connect()ed ntlibc socket on linux";
+	const char msg1[] = "hello from a real connect()ed spicule socket on linux";
 	const char msg2[] = "and a real accept()ed reply travels back the other way";
 	char buf[128];
 

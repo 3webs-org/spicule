@@ -20,7 +20,7 @@
  * ------------------------------------------
  * src/util/crontime.c does the real work (ranges/steps/lists/names,
  * the dom-vs-dow OR-not-AND special case); this file's only job is to
- * notice when $HOME/.ntlibc/crontabs/crontab (src/util/spool.h) has
+ * notice when $HOME/.spicule/crontabs/crontab (src/util/spool.h) has
  * changed -- stat()ing its mtime once per poll tick, exactly the way
  * src/util/spool.h's own header documents crond doing it, no lock
  * needed because crontab(1p) always publishes a complete file via
@@ -31,7 +31,7 @@
  * -------------------------------------------------------
  * crontab(5)'s finest field is minutes, so a schedule can only ever
  * mean to the wall-clock minute -- this file polls every
- * NTLIBC_CROND_POLL_MS (default 1000ms, the same test-speed-only
+ * SPICULE_CROND_POLL_MS (default 1000ms, the same test-speed-only
  * override src/util/atd.c documents for its own poll interval) but
  * only ever *fires* an entry once per distinct wall-clock minute
  * (tracked via last_fired_minute below, an epoch-seconds-over-60
@@ -58,7 +58,7 @@
  * pass -- see src/util/atbatch.h's identical note for at(1p)/
  * batch(1p)), so real cron's "mail the job's output to the user" has
  * the same honest fallback here: every run's combined stdout+stderr
- * is appended to $HOME/.ntlibc/crontabs/cron.log, preceded by a
+ * is appended to $HOME/.spicule/crontabs/cron.log, preceded by a
  * header line naming the entry and the time it ran, so a user who
  * wants to know what their crontab has been doing has exactly one
  * place to look.
@@ -75,6 +75,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <spawn.h>
+#include "util.h"
 #include "spool.h"
 #include "crontime.h"
 #include "libc.h" /* __find_program() */
@@ -103,11 +104,14 @@ static int grow_entries(struct cron_entry **arr, int *n, int *cap)
 {
 	if (*n < *cap) return 0;
 	{
-		int newcap = *cap ? *cap * 2 : 8;
-		struct cron_entry *n2 = realloc(*arr, (size_t)newcap * sizeof **arr);
+		size_t newcap;
+		struct cron_entry *n2;
+		if (!__util_array_capacity((size_t)*cap, (size_t)*n, 1, 8, sizeof **arr, &newcap) ||
+		    newcap > (size_t)INT_MAX) return -1;
+		n2 = __util_reallocarray(*arr, newcap, sizeof **arr);
 		if (!n2) return -1;
 		*arr = n2;
-		*cap = newcap;
+		*cap = (int)newcap;
 	}
 	return 0;
 }
@@ -164,8 +168,8 @@ static void reload_crontab(const char *path)
 			fprintf(stderr, "crond: %s:%ld: environment assignments are not supported, skipped\n", path, lineno);
 			continue;
 		}
-		for (i = 0; i < 5 && ok; i++)
-			if (split_field(&p, fields[i], sizeof fields[i]) < 0) ok = 0;
+		for (i = 0; i < 5; i++)
+			if (split_field(&p, fields[i], sizeof fields[i]) < 0) { ok = 0; break; }
 		if (ok) {
 			while (*p == ' ' || *p == '\t') p++;
 			if (*p == '\n' || *p == 0) ok = 0;
@@ -177,8 +181,10 @@ static void reload_crontab(const char *path)
 			continue;
 		}
 		{
-			size_t cmdlen = strcspn(p, "\n");
-			char *cmd = malloc(cmdlen + 1);
+			size_t cmdlen = strcspn(p, "\n"), cmdbytes;
+			char *cmd;
+			if (!__util_size_add(cmdlen, 1, &cmdbytes)) break;
+			cmd = malloc(cmdbytes);
 			if (!cmd) break;
 			memcpy(cmd, p, cmdlen);
 			cmd[cmdlen] = 0;
@@ -188,7 +194,7 @@ static void reload_crontab(const char *path)
 			n++;
 		}
 	}
-	fclose(f);
+	(void)fclose(f);
 	g_entries = arr;
 	g_nentries = n;
 }
@@ -202,14 +208,16 @@ static void reload_crontab(const char *path)
  * NULL in that case). */
 static void split_percent(const char *raw, char **cmd_out, char **stdin_out)
 {
-	size_t len = strlen(raw);
-	char *cmd = malloc(len + 1);
-	char *body = malloc(len + 1);
+	size_t len = strlen(raw), bytes;
+	char *cmd, *body;
 	size_t ci = 0, bi = 0;
 	int in_body = 0;
 	size_t i;
 
 	*cmd_out = *stdin_out = 0;
+	if (!__util_size_add(len, 1, &bytes)) return;
+	cmd = malloc(bytes);
+	body = malloc(bytes);
 	if (!cmd || !body) { free(cmd); free(body); return; }
 
 	for (i = 0; i < len; i++) {
@@ -231,7 +239,7 @@ static void split_percent(const char *raw, char **cmd_out, char **stdin_out)
 	*stdin_out = body;
 }
 
-struct running_job { pid_t pid; char stdin_path[NTLIBC_SPOOL_PATH_MAX]; };
+struct running_job { pid_t pid; char stdin_path[SPICULE_SPOOL_PATH_MAX]; };
 #define MAX_RUNNING 128
 static struct running_job g_running[MAX_RUNNING];
 static int g_nrunning;
@@ -243,7 +251,9 @@ static void reap_finished(void)
 		int status;
 		pid_t r = waitpid(g_running[i].pid, &status, WNOHANG);
 		if (r == g_running[i].pid) {
-			unlink(g_running[i].stdin_path);
+			if (unlink(g_running[i].stdin_path) < 0)
+				fprintf(stderr, "crond: cannot clean up %s: %s\n",
+				        g_running[i].stdin_path, strerror(errno));
 			g_running[i] = g_running[g_nrunning - 1];
 			g_nrunning--;
 			continue;
@@ -264,8 +274,8 @@ static void run_entry(const char *crontabs_dir, const struct cron_entry *e, time
 {
 	extern char **environ;
 	char *cmd, *stdin_body;
-	char logpath[NTLIBC_SPOOL_PATH_MAX];
-	char stdin_path[NTLIBC_SPOOL_PATH_MAX];
+	char logpath[SPICULE_SPOOL_PATH_MAX];
+	char stdin_path[SPICULE_SPOOL_PATH_MAX];
 	FILE *log, *sf;
 	char *sh_path;
 	posix_spawn_file_actions_t fa;
@@ -287,7 +297,8 @@ static void run_entry(const char *crontabs_dir, const struct cron_entry *e, time
 	log = fopen(logpath, "a");
 	if (log) {
 		fprintf(log, "==== %s: %s ====\n", ct ? ct : "?", cmd);
-		fclose(log);
+		if (fclose(log) < 0)
+			fprintf(stderr, "crond: %s: %s\n", logpath, strerror(errno));
 	}
 
 	if (snprintf(stdin_path, sizeof stdin_path, "%s/cron.stdin.XXXXXX", crontabs_dir) >= (int)sizeof stdin_path) {
@@ -299,16 +310,16 @@ static void run_entry(const char *crontabs_dir, const struct cron_entry *e, time
 	sf = fdopen(fd, "w");
 	if (sf) {
 		fputs(stdin_body, sf);
-		fclose(sf);
+		if (fclose(sf) != 0) { (void)unlink(stdin_path); free(cmd); free(stdin_body); return; }
 	} else {
-		close(fd);
+		(void)close(fd);
 	}
 
 	sh_path = __find_program("sh", 1);
-	if (!sh_path) { unlink(stdin_path); free(cmd); free(stdin_body); return; }
+	if (!sh_path) { (void)unlink(stdin_path); free(cmd); free(stdin_body); return; }
 
 	if (posix_spawn_file_actions_init(&fa) != 0) {
-		free(sh_path); unlink(stdin_path); free(cmd); free(stdin_body);
+		free(sh_path); (void)unlink(stdin_path); free(cmd); free(stdin_body);
 		return;
 	}
 	(void)posix_spawn_file_actions_addopen(&fa, 0, stdin_path, O_RDONLY, 0);
@@ -325,7 +336,7 @@ static void run_entry(const char *crontabs_dir, const struct cron_entry *e, time
 		strcpy(g_running[g_nrunning].stdin_path, stdin_path);
 		g_nrunning++;
 	} else {
-		unlink(stdin_path);
+		(void)unlink(stdin_path);
 	}
 	posix_spawn_file_actions_destroy(&fa);
 	free(sh_path);
@@ -333,12 +344,13 @@ static void run_entry(const char *crontabs_dir, const struct cron_entry *e, time
 	free(stdin_body);
 }
 
-int __util_crond_main(int argc, char **argv)
+int __util_crond_main(
+	int argc, char **argv elements_withtok(null_terminated, argc))
 {
-	char crontabs_dir[NTLIBC_SPOOL_PATH_MAX];
-	char path[NTLIBC_SPOOL_PATH_MAX];
+	char crontabs_dir[SPICULE_SPOOL_PATH_MAX];
+	char path[SPICULE_SPOOL_PATH_MAX];
 	long poll_ms = 1000;
-	const char *env_poll = getenv("NTLIBC_CROND_POLL_MS");
+	const char *env_poll = getenv("SPICULE_CROND_POLL_MS");
 	time_t last_mtime = 0;
 	long last_fired_minute = -1;
 	int have_mtime = 0;

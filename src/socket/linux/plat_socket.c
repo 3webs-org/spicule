@@ -6,9 +6,9 @@
  * this file follows too.
  *
  * Much simpler than the NT backend's \Device\Afd wire protocol, since
- * ntlibc's own AF_INET/SOCK_STREAM/IPPROTO_TCP values and struct
+ * spicule's own AF_INET/SOCK_STREAM/IPPROTO_TCP values and struct
  * sockaddr_in layout already match the real kernel socket ABI exactly.
- * SOL_SOCKET/SO_REUSEADDR are the one exception -- ntlibc's own
+ * SOL_SOCKET/SO_REUSEADDR are the one exception -- spicule's own
  * <sys/socket.h> gives them a private encoding that does NOT match the
  * real kernel ABI, so __plat_socket_bind()'s reuseaddr flag is translated
  * explicitly via setsockopt(2) before bind(2), the same pattern
@@ -25,7 +25,7 @@
  * as an ordinary side effect (unless MSG_NOSIGNAL).
  */
 
-/* This translation unit implements ntlibc's freestanding -nostdinc
+/* This translation unit implements spicule's freestanding -nostdinc
  * public-header contract; transitive ABI declarations are intentional,
  * so hosted include ownership and unused-include advice do not apply. */
 // NOLINTBEGIN(misc-include-cleaner)
@@ -33,6 +33,7 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include "plat_socket.h"
+#include "unsafe_pointer.h"
 
 /* aarch64/x86_64 Linux syscall numbers, confirmed against each host's own
  * <sys/syscall.h>. Neither arch has a separate SYS_recv/SYS_send: glibc's
@@ -166,19 +167,22 @@ static int unbox(__plat_handle_t h)
  * (socket(2), accept4(2)) rather than operating on an already-boxed one. */
 static __plat_handle_t box(int fd)
 {
-	return (__plat_handle_t)(long)(fd + 1);
+	/* __plat_handle_t is an opaque one-word carrier shared with the NT
+	 * backend; the real payload here is the plain fd number, boxed +1
+	 * so 0 stays free for __PLAT_HANDLE_NULL, never dereferenced. */
+	return unsafe_assume_valid_pointer((__plat_handle_t)(long)(fd + 1));
 }
 
-/* ntlibc's own <sys/socket.h> SOL_SOCKET/SO_REUSEADDR are a private
+/* spicule's own <sys/socket.h> SOL_SOCKET/SO_REUSEADDR are a private
  * encoding that does not match the real Linux kernel ABI, so bind()'s
  * reuseaddr flag is translated explicitly, never passed through. */
 #define LX_SOL_SOCKET   1
 #define LX_SO_REUSEADDR 2
-/* Real Linux kernel SOL_SOCKET option numbers, not ntlibc's own encoding. */
+/* Real Linux kernel SOL_SOCKET option numbers, not spicule's own encoding. */
 #define LX_SO_SNDBUF    7
 #define LX_SO_RCVBUF    8
 
-/* ntlibc's own <sys/socket.h> MSG_* bits are a private encoding, not a
+/* spicule's own <sys/socket.h> MSG_* bits are a private encoding, not a
  * copy of any host ABI. MSG_OOB/MSG_PEEK/MSG_DONTROUTE/MSG_NOSIGNAL
  * happen to already match the Linux kernel's flag bits, but
  * MSG_TRUNC/MSG_CTRUNC/MSG_EOR/MSG_WAITALL do NOT -- so every flag is
@@ -304,7 +308,7 @@ int __plat_socket_getsockname(__plat_handle_t h, struct sockaddr *addr, socklen_
 }
 
 /* shutdown(): a real shutdown(2). `how` passes straight through: Linux's
- * SHUT_RD/SHUT_WR/SHUT_RDWR are the same POSIX-standard values ntlibc's
+ * SHUT_RD/SHUT_WR/SHUT_RDWR are the same POSIX-standard values spicule's
  * own <sys/socket.h> already uses. */
 int __plat_socket_shutdown(__plat_handle_t h, int how)
 {

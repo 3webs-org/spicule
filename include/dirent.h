@@ -52,6 +52,7 @@ struct dirent {
 /* dp is undefined unless it designates an open directory stream, per
  * POSIX; nonnull makes that contract compiler-checkable. */
 __attribute__((nonnull(1)))
+fallible
 int            closedir(DIR * consume(directory_stream_open));
 withtok(directory_stream_open)
 DIR           *fdopendir(int);
@@ -64,12 +65,12 @@ void           rewinddir(DIR *) __attribute__((nonnull(1)));
 int            dirfd(DIR *) __attribute__((nonnull(1)));
 
 /* alphasort/versionsort's nonnull covers a/b themselves; it can't express
- * that *a/*b (one level further in) are also non-NULL, but qsort_r never
+ * that *a and *b (one level further in) are also non-NULL, but qsort_r never
  * invokes a comparator outside the array scandir() builds, so that holds
  * by construction. filter/compar are optional and left unmarked. */
 int alphasort(const struct dirent **, const struct dirent **)
     __attribute__((nonnull(1, 2)));
-int scandir(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **))
+int scandir(const char *, struct dirent *** withtok(internal_heap_allocated), int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **))
     __attribute__((nonnull(2)));
 
 #if defined(_XOPEN_SOURCE) || defined(_GNU_SOURCE) || defined(_BSD_SOURCE)

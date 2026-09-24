@@ -20,12 +20,12 @@
  * fabricating a location neither names), so a spool path and `cd`'s
  * own idea of "home" can never disagree.
  *
- * Given that, the spool root is $HOME/.ntlibc/, with two
+ * Given that, the spool root is $HOME/.spicule/, with two
  * subdirectories:
  *
- *   $HOME/.ntlibc/atjobs/      one <id>.job (+ <id>.out once it has
+ *   $HOME/.spicule/atjobs/      one <id>.job (+ <id>.out once it has
  *                              run) per job at(1p)/batch(1p) submitted
- *   $HOME/.ntlibc/crontabs/    one file, "crontab", holding the single
+ *   $HOME/.spicule/crontabs/    one file, "crontab", holding the single
  *                              real user's crontab (see src/util/
  *                              crontab.c's own header for why one file
  *                              is the whole of the multi-user question
@@ -67,18 +67,24 @@
  * same publish-by-rename idiom as above. crond (src/util/crond.c)
  * notices a new crontab by stat()ing its mtime once per poll tick and
  * reparsing only when it has changed -- no lock needed there either,
- * for the same reason: it only ever sees a complete file. */
-#ifndef _NTLIBC_SPOOL_H
-#define _NTLIBC_SPOOL_H
+ * for the same reason: it only ever sees a complete file.
+ *
+ * This internal header, like the public C library headers, must use the
+ * implementation-reserved namespace for its guard and its own declarations
+ * so they cannot collide with user code. */
+// NOLINTBEGIN(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp)
+#ifndef _SPICULE_SPOOL_H
+#define _SPICULE_SPOOL_H
 
 #include <stdio.h>
 #include <stddef.h>
 #include <time.h>
+#include <ownership.h>
 
-/* Longest path this file ever builds: $HOME + "/.ntlibc/crontabs/crontab.tmp".
+/* Longest path this file ever builds: $HOME + "/.spicule/crontabs/crontab.tmp".
  * 4096 comfortably covers any real NT or Linux path without a second,
  * dynamic-growth path to test. */
-#define NTLIBC_SPOOL_PATH_MAX 4096
+#define SPICULE_SPOOL_PATH_MAX 4096
 
 /* __spool_home(): fills buf (bufsz bytes) with the current user's home
  * directory -- getenv("HOME") if set and non-empty, else
@@ -88,9 +94,9 @@
  * getpwuid() uses) if neither source has one. */
 int __spool_home(char *buf, size_t bufsz);
 
-/* __spool_dir(): fills buf with $HOME/.ntlibc/<sub> and ensures every
- * component of it exists as a directory (mkdir()ing $HOME/.ntlibc and
- * then $HOME/.ntlibc/<sub> in turn, tolerating EEXIST at each level --
+/* __spool_dir(): fills buf with $HOME/.spicule/<sub> and ensures every
+ * component of it exists as a directory (mkdir()ing $HOME/.spicule and
+ * then $HOME/.spicule/<sub> in turn, tolerating EEXIST at each level --
  * $HOME itself is assumed to already exist and is never created).
  * Returns 0 on success, -1 with errno set (from mkdir() or from
  * __spool_home()'s "no home directory" case, reported as ENOENT since
@@ -107,6 +113,11 @@ int __spool_dir(const char *sub, char *buf, size_t bufsz);
  * __spool_publish_job() to make it visible to atd. Returns NULL with
  * errno set on failure (out of ids after a bounded number of
  * attempts, or a real open() failure). */
+/* tools/clang/ErrnoDisciplineChecker.cpp's spicule.ErrnoDiscipline: see
+ * this function's own doc comment above -- "Returns NULL with errno
+ * set on failure". */
+grants_thread_token(errno_grounds)
+withtok(file_stream_open)
 FILE *__spool_new_job(const char *dir, char *id_out, size_t id_out_sz,
 	char *path_out, size_t path_out_sz);
 
@@ -116,6 +127,10 @@ FILE *__spool_new_job(const char *dir, char *id_out, size_t id_out_sz,
  * failure (in which case the caller should unlink() the .tmp file
  * itself -- this function does not, since a caller may want to
  * inspect it first for diagnostics). */
+/* tools/clang/ErrnoDisciplineChecker.cpp's spicule.ErrnoDiscipline: see
+ * this function's own doc comment above -- "-1 with errno set on
+ * failure". */
+grants_thread_token(errno_grounds)
 int __spool_publish_job(const char *path);
 
 /* __spool_job_header(): reads a job file's "#run_at N" and
@@ -137,7 +152,7 @@ int __spool_publish_job(const char *path);
 int __spool_job_header(const char *path, time_t *run_at, char *queue, size_t queue_sz);
 
 /* __spool_crontab_path(): fills buf with the one real crontab file
- * this library ever has, $HOME/.ntlibc/crontabs/crontab (ensuring
+ * this library ever has, $HOME/.spicule/crontabs/crontab (ensuring
  * the crontabs/ directory itself exists via __spool_dir()). Shared
  * between src/util/crontab.c (-e/-l/-r) and src/util/crond.c (which
  * needs the identical path to notice it has changed) rather than
@@ -147,3 +162,5 @@ int __spool_job_header(const char *path, time_t *run_at, char *queue, size_t que
 const char *__spool_crontab_path(char *buf, size_t bufsz);
 
 #endif
+
+// NOLINTEND(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp)

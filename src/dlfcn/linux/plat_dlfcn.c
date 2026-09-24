@@ -1,12 +1,12 @@
 /* SPDX-FileCopyrightText: (C) 2026 Gavin John
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * src/internal/plat_dlfcn.h's Linux backend: a real, from-scratch
- * ELF64 dynamic loader for dlopen()/dlsym()/dlclose()/dlerror(),
+ * src/internal/plat_dlfcn.h's Linux backend: a real, from-scratch ELF
+ * dynamic loader for dlopen()/dlsym()/dlclose()/dlerror(),
  * linked directly into libc.a -- no separate ld.so, no PT_INTERP, no
  * mmap'd-off-disk loader spliced in later the way glibc's "static
  * dlopen" retrofit works (which is also the cause of glibc bug 20802,
- * getauxval() breaking after static dlopen). ntlibc's Linux port has
+ * getauxval() breaking after static dlopen). spicule's Linux port has
  * no PT_INTERP to begin with and no existing ld.so to reuse, so this
  * file just IS the loader: ordinary code in libc.a that mmaps a
  * caller-named .so, parses it, relocates it, and hands back an opaque
@@ -22,23 +22,29 @@
  *
  * See test/posix-dl-linux.c for running proof of every "yes" below.
  *
- *   - ELF64, ELFCLASS64/ELFDATA2LSB, EM_AARCH64 or EM_X86_64 only.
- *     i386 is NOT implemented: its real ABI is ELF32/DT_REL (addends
- *     implicit in the relocated word) vs. this file's ELF64/DT_RELA
- *     model -- a genuinely different loader shape, not a drop-in
- *     relocation-table swap.
+ *   - ELFDATA2LSB, EM_AARCH64/EM_X86_64/EM_386. ELFCLASS64 on aarch64/
+ *     x86_64, ELFCLASS32 on i386 -- a real class difference, not just a
+ *     narrower ELFCLASS64: see this file's own "minimal local ELF32/
+ *     ELF64 shapes" banner for the Elf_* generic-typedef scheme that
+ *     covers the struct-shape half of that split, and apply_reloc_
+ *     table()'s own banner for the SHT_REL-vs-SHT_RELA (implicit-vs-
+ *     explicit addend) half.
  *   - ET_DYN (shared object) input only.
  *   - PT_LOAD segments mapped faithfully, including bss tail-zeroing.
  *   - PT_DYNAMIC: DT_HASH (an exact symbol count; DT_GNU_HASH is NOT
- *     supported), DT_SYMTAB/DT_STRTAB/DT_SYMENT, DT_RELA/DT_JMPREL
- *     (PLT relocations processed identically to DT_RELA -- this
- *     loader always binds eagerly, so RTLD_NOW vs. RTLD_LAZY is moot),
- *     DT_NEEDED, DT_INIT/DT_INIT_ARRAY.
+ *     supported), DT_SYMTAB/DT_STRTAB/DT_SYMENT, DT_RELA/DT_JMPREL on
+ *     aarch64/x86_64 or DT_REL/DT_JMPREL on i386 (PLT relocations
+ *     processed identically to DT_RELA/DT_REL -- this loader always
+ *     binds eagerly, so RTLD_NOW vs. RTLD_LAZY is moot), DT_NEEDED,
+ *     DT_INIT/DT_INIT_ARRAY.
  *   - Relocations: R_AARCH64_RELATIVE/ABS64/GLOB_DAT/JUMP_SLOT/
  *     IRELATIVE (GNU ifunc) and R_AARCH64_TLSDESC (aarch64), the
- *     equivalent R_X86_64_* set (x86_64). Anything else is a clean,
- *     loud dlopen() failure (apply_one_reloc()'s `default:` case),
- *     never a silent mis-relocation.
+ *     equivalent R_X86_64_* set (x86_64), the equivalent R_386_* set
+ *     minus an IRELATIVE-shaped TLS descriptor equivalent (i386 --
+ *     PT_TLS is refused outright there, see below, so no i386 TLS
+ *     relocation type is ever reached). Anything else is a clean, loud
+ *     dlopen() failure (apply_one_reloc()'s `default:` case), never a
+ *     silent mis-relocation.
  *   - PT_TLS: loaded for real on aarch64 (see "TLS / per-library
  *     thread descriptors" below). Refused cleanly, before anything is
  *     mapped, on every other architecture.
@@ -152,7 +158,7 @@
  * real DTV; this file's module-id allocator (next_tls_module_id) and
  * DTV-growth function (tls_dtv_ensure_capacity()) hand every
  * PT_TLS-bearing object a fresh id and slot (setup_object_tls()); and
- * __ntlibc_tlsdesc_resolver (hand-written aarch64 asm, see its own
+ * __spicule_tlsdesc_resolver (hand-written aarch64 asm, see its own
  * banner near apply_one_reloc()) is the runtime resolver R_AARCH64_
  * TLSDESC relocations are wired to. See test/posix-dl-linux.c's
  * test_pt_tls_per_object() for running proof.
@@ -193,7 +199,7 @@
  * teardown_obj() as a whole -- deferred, disclosed rather than hidden.
  */
 
-/* This translation unit implements ntlibc's freestanding -nostdinc
+/* This translation unit implements spicule's freestanding -nostdinc
  * public-header contract; transitive ABI declarations are intentional,
  * so hosted include ownership and unused-include advice do not apply. */
 // NOLINTBEGIN(misc-include-cleaner)
@@ -208,7 +214,10 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <pthread.h>
+#include "libc.h"
 #include "plat_dlfcn.h"
+#include "unsafe_pointer.h"
+#include "ownership_stubs.h"
 
 static int table_bytes(size_t count, size_t element_size, size_t *out)
 {
@@ -267,7 +276,7 @@ static unsigned long pgup(unsigned long v) { unsigned long p = real_page_size();
  * Found empirically, disclosed here rather than silently worked around:
  * this loader's address-space layout is exactly "reserve one big span,
  * then MAP_FIXED several independent file-backed sub-mappings inside
- * it, at exact addresses this file itself computes" -- and ntlibc's own
+ * it, at exact addresses this file itself computes" -- and spicule's own
  * public mmap() front door (src/mman/mman.c) is NOT built to support
  * that pattern. Read in full once this broke: mman.c keeps its own
  * reservation-table bookkeeping, one reservation PER mmap() call, and
@@ -302,13 +311,7 @@ static unsigned long pgup(unsigned long v) { unsigned long p = real_page_size();
  * own raw_syscall() banner for the fuller per-arch rationale.
  * Duplicated here, not shared, per this tree's own "own syscall table
  * per file" discipline every src/.../linux/plat_*.c backend already
- * follows. i386 is NOT implemented here (this file's own EM_AARCH64/
- * EM_X86_64-only banner above): plat_dlfcn.c's whole ELF64/RELA data
- * model (Elf64_* structs, DT_RELA, no-addend-implicit-in-instruction
- * REL) does not carry over to i386's real ABI (ELF32, DT_REL, implicit
- * addends) by just adding a syscall trampoline and a relocation-type
- * table -- see this file's own top banner for what a real i386 loader
- * port would additionally need. */
+ * follows. */
 #if defined(__aarch64__)
 static long raw_syscall(long nr, long a1, long a2, long a3, long a4, long a5, long a6) // NOLINT(bugprone-easily-swappable-parameters) -- raw syscall ABI slots are positional and semantically distinct
 {
@@ -344,18 +347,76 @@ static long raw_syscall(long nr, long a1, long a2, long a3, long a4, long a5, lo
 #define SYS_mmap     9
 #define SYS_munmap   11
 #define SYS_mprotect 10
+#elif defined(__i386__)
+static long raw_syscall(long nr, long a1, long a2, long a3, long a4, long a5, long a6)
+{
+	long args[7];
+	long ret;
+	args[0] = nr; args[1] = a1; args[2] = a2; args[3] = a3;
+	args[4] = a4; args[5] = a5; args[6] = a6;
+	__asm__ volatile(
+		"pushl %%ebp\n\t"
+		"pushl %%ebx\n\t"
+		"movl 4(%%eax), %%ebx\n\t"
+		"movl 8(%%eax), %%ecx\n\t"
+		"movl 12(%%eax), %%edx\n\t"
+		"movl 16(%%eax), %%esi\n\t"
+		"movl 20(%%eax), %%edi\n\t"
+		"movl 24(%%eax), %%ebp\n\t"
+		"movl (%%eax), %%eax\n\t"
+		"int $0x80\n\t"
+		"popl %%ebx\n\t"
+		"popl %%ebp"
+		: "=a"(ret)
+		: "a"(args)
+		: "ecx", "edx", "esi", "edi", "memory", "cc");
+	return ret;
+}
+/* SYS_munmap/SYS_mprotect are ordinary direct syscalls, same shape as
+ * every other arch above -- confirmed against this host's own /nix/store
+ * linux-headers asm/unistd_32.h. SYS_mmap is deliberately the OLD,
+ * `__NR_mmap`==90 entry (sys_old_mmap), not mmap2 (192): mmap2's own
+ * pgoff argument is defined in fixed 4096-byte units regardless of the
+ * real page size (Linux mmap2(2) itself documents this), a second,
+ * independent unit this loader would have to convert pgdown(ph->p_offset)
+ * into on top of real_page_size() above -- old mmap's single argument is
+ * instead a pointer to a `{addr,len,prot,flags,fd,offset}` word array
+ * with a plain BYTE offset (mm/mmap.c's sys_old_mmap()), the exact same
+ * byte-offset contract raw_mmap() already hands every other architecture
+ * here, so this arch's own trampoline (immediately below) is the only
+ * i386-specific piece needed -- no separate pgoff-unit conversion
+ * anywhere else in this file. */
+#define SYS_mmap     90
+#define SYS_munmap   91
+#define SYS_mprotect 125
 #else
-#error "plat_dlfcn.c: unsupported architecture (expected __aarch64__ or __x86_64__ -- see this file's own banner for why i386 is not yet implemented)"
+#error "plat_dlfcn.c: unsupported architecture (expected __aarch64__, __x86_64__ or __i386__)"
 #endif
 
 static int is_sys_error(long ret) { return (unsigned long)ret >= (unsigned long)-4095L; }
 
+#if defined(__i386__)
+static void *raw_mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
+{
+	long args[6];
+	long ret;
+	args[0] = (long)addr; args[1] = (long)len; args[2] = (long)prot;
+	args[3] = (long)flags; args[4] = (long)fd; args[5] = off;
+	ret = raw_syscall(SYS_mmap, (long)args, 0, 0, 0, 0, 0);
+	if (is_sys_error(ret)) { errno = (int)-ret; return MAP_FAILED; }
+	return (void *)ret;
+}
+#else
 static void *raw_mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
 {
 	long ret = raw_syscall(SYS_mmap, (long)addr, (long)len, (long)prot, (long)flags, (long)fd, off);
 	if (is_sys_error(ret)) { errno = (int)-ret; return MAP_FAILED; }
-	return (void *)ret;
+	/* mmap(2) returns the mapped address in a signed machine-word
+	 * syscall register; converting that ABI word to a pointer is the
+	 * operation this function exists to perform. */
+	return unsafe_assume_valid_pointer((void *)ret);
 }
+#endif
 static int raw_munmap(void *addr, size_t len)
 {
 	long ret = raw_syscall(SYS_munmap, (long)addr, (long)len, 0, 0, 0, 0);
@@ -369,7 +430,7 @@ static int raw_mprotect(void *addr, size_t len, int prot)
 	return 0;
 }
 
-/* ---- minimal local ELF64 shapes --------------------------------------
+/* ---- minimal local ELF32/ELF64 shapes ---------------------------------
  *
  * This project ships no <elf.h> yet -- the same gap crt/linux/crt1.c's
  * own local `struct elf64_phdr` already lives with, for the same
@@ -383,8 +444,25 @@ static int raw_mprotect(void *addr, size_t len, int prot)
  * crt1.c's very early, allocator-free bootstrap context, and neither
  * is worth the coupling for what would still only be a handful of
  * struct definitions duplicated once. Field widths/order below are
- * ELFCLASS64's, architecture-independent (same caveat crt1.c's own
- * comment already states for its Phdr shape). */
+ * each ELFCLASS's own, architecture-independent within a class (same
+ * caveat crt1.c's own comment already states for its Phdr shape) --
+ * confirmed field-for-field, including the real on-disk field ORDER
+ * (which genuinely differs between the two classes -- see Elf32_Phdr's
+ * own comment below), against this host's own /nix/store glibc-dev
+ * <elf.h>.
+ *
+ * i386 is a real ELFCLASS32 target, not just a narrower ELFCLASS64:
+ * Elf_Ehdr/Phdr/Shdr/Dyn/Sym below resolve to either width via the
+ * Elf_* typedefs just past them, since every FIELD those five carry
+ * has a straightforward same-name 32-vs-64-bit counterpart. Relocation
+ * entries do not: i386's psABI uses SHT_REL (Elf32_Rel, no r_addend
+ * field -- the addend is implicit, packed into the word already sitting
+ * at the relocation target) where aarch64/x86_64 use SHT_RELA (Elf64_Rela,
+ * an explicit r_addend field) -- a real format difference, not a width
+ * difference, so Elf32_Rel/Elf64_Rela are kept as two genuinely separate
+ * types with no shared Elf_Rel alias; apply_reloc_table()/apply_irelative_
+ * table() below normalize both into one common `struct reloc` before
+ * calling into the (fully shared) per-relocation appliers. */
 typedef struct {
 	unsigned char e_ident[16];
 	uint16_t e_type, e_machine;
@@ -424,13 +502,85 @@ typedef struct {
 	int64_t r_addend;
 } Elf64_Rela;
 
+typedef struct {
+	unsigned char e_ident[16];
+	uint16_t e_type, e_machine;
+	uint32_t e_version;
+	uint32_t e_entry, e_phoff, e_shoff;
+	uint32_t e_flags;
+	uint16_t e_ehsize, e_phentsize, e_phnum;
+	uint16_t e_shentsize, e_shnum, e_shstrndx;
+} Elf32_Ehdr;
+
+/* Elf32_Phdr's own field ORDER genuinely differs from Elf64_Phdr's above
+ * (p_flags sits right after p_type on ELFCLASS64, but after p_memsz on
+ * ELFCLASS32) -- confirmed against the real header, not assumed; this
+ * struct's field order below matches ELFCLASS32's real on-disk layout,
+ * which is what makes a plain pread() into it correct. */
+typedef struct {
+	uint32_t p_type;
+	uint32_t p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align;
+} Elf32_Phdr;
+
+typedef struct {
+	uint32_t sh_name, sh_type;
+	uint32_t sh_flags, sh_addr, sh_offset, sh_size;
+	uint32_t sh_link, sh_info;
+	uint32_t sh_addralign, sh_entsize;
+} Elf32_Shdr;
+
+typedef struct {
+	int32_t d_tag;
+	uint32_t d_val;
+} Elf32_Dyn;
+
+/* Elf32_Sym's field order differs from Elf64_Sym's above too (name,
+ * value, size, info, other, shndx -- info/other/shndx move to the END
+ * on ELFCLASS32, confirmed against the real header) -- same "order
+ * matters for a raw pread()" reasoning as Elf32_Phdr just above. */
+typedef struct {
+	uint32_t st_name;
+	uint32_t st_value, st_size;
+	unsigned char st_info, st_other;
+	uint16_t st_shndx;
+} Elf32_Sym;
+
+/* SHT_REL, not SHT_RELA -- see this section's own banner: i386's addend
+ * is implicit (packed into the relocated word itself), so this struct,
+ * unlike Elf64_Rela above, carries no r_addend field at all. */
+typedef struct {
+	uint32_t r_offset, r_info;
+} Elf32_Rel;
+
+#if defined(__i386__)
+typedef Elf32_Ehdr Elf_Ehdr;
+typedef Elf32_Phdr Elf_Phdr;
+typedef Elf32_Shdr Elf_Shdr;
+typedef Elf32_Dyn  Elf_Dyn;
+typedef Elf32_Sym  Elf_Sym;
+#else
+typedef Elf64_Ehdr Elf_Ehdr;
+typedef Elf64_Phdr Elf_Phdr;
+typedef Elf64_Shdr Elf_Shdr;
+typedef Elf64_Dyn  Elf_Dyn;
+typedef Elf64_Sym  Elf_Sym;
+#endif
+
 #define EI_CLASS 4
 #define EI_DATA  5
+#define ELFCLASS32 1
 #define ELFCLASS64 2
 #define ELFDATA2LSB 1
-#define EM_AARCH64 183
+#define EM_386     3
 #define EM_X86_64  62
+#define EM_AARCH64 183
 #define ET_DYN 3
+
+#if defined(__i386__)
+#define ELF_CLASS ELFCLASS32
+#else
+#define ELF_CLASS ELFCLASS64
+#endif
 
 #define PT_LOAD    1
 #define PT_DYNAMIC 2
@@ -461,10 +611,33 @@ typedef struct {
 #define DT_STRSZ    10
 #define DT_SYMENT   11
 #define DT_INIT     12
+#define DT_REL      17
+#define DT_RELSZ    18
+#define DT_RELENT   19
 #define DT_PLTREL   20
 #define DT_JMPREL   23
 #define DT_INIT_ARRAY   25
 #define DT_INIT_ARRAYSZ 27
+
+/* DT_REL/DT_RELSZ/DT_RELENT (i386, SHT_REL) vs. DT_RELA/DT_RELASZ/
+ * DT_RELAENT (aarch64/x86_64, SHT_RELA) name the SAME three dynamic-
+ * section facts -- "where is the main relocation table, how big is it,
+ * how big is one entry" -- under genuinely different tags because the
+ * two ELF classes use genuinely different on-disk relocation formats
+ * (see this file's own "minimal local ELF32/ELF64 shapes" banner).
+ * DT_PLTREL's own OWN value on a real object is one of these two tag
+ * numbers too (it names which format the PLT's relocations use), which
+ * is exactly why load_object()'s own DT_PLTREL check below compares
+ * against this same macro rather than hardcoding DT_RELA. */
+#if defined(__i386__)
+#define DT_REL_TAG    DT_REL
+#define DT_RELSZ_TAG  DT_RELSZ
+#define DT_RELENT_TAG DT_RELENT
+#else
+#define DT_REL_TAG    DT_RELA
+#define DT_RELSZ_TAG  DT_RELASZ
+#define DT_RELENT_TAG DT_RELAENT
+#endif
 
 #define SHN_UNDEF 0
 
@@ -475,6 +648,12 @@ typedef struct {
 
 #define ELF64_R_SYM(i)  ((uint32_t)((i) >> 32))
 #define ELF64_R_TYPE(i) ((uint32_t)((i) & 0xffffffffu))
+/* Elf32_Rel's r_info packs sym/type differently from Elf64_Rela's above
+ * (8 bits of type, not 32 -- confirmed against the real header): a real
+ * format difference this loader's i386 relocation-table walk must use
+ * instead of ELF64_R_SYM/TYPE, not a special case of them. */
+#define ELF32_R_SYM(i)  ((uint32_t)((i) >> 8))
+#define ELF32_R_TYPE(i) ((uint32_t)((i) & 0xffu))
 
 #define R_AARCH64_ABS64      257
 #define R_AARCH64_GLOB_DAT   1025
@@ -487,7 +666,7 @@ typedef struct {
  * __tls_get_addr()/R_AARCH64_TLS_DTPMOD64+DTPREL64 "general dynamic"
  * pair) is flatly rejected as an "unsupported option" for this target.
  * See this file's own "TLS / per-library thread descriptors" banner
- * and the __ntlibc_tlsdesc_resolver asm block further down for the
+ * and the __spicule_tlsdesc_resolver asm block further down for the
  * runtime side of what this relocation type needs. */
 #define R_AARCH64_TLSDESC    1031
 /* GNU indirect-function ("ifunc") relocation -- confirmed empirically
@@ -531,6 +710,24 @@ typedef struct {
  * against -- see this file's own TLS banner for the identical caveat
  * already disclosed there for a different feature). */
 #define R_X86_64_IRELATIVE   37
+
+/* i386 psABI relocation type numbers -- confirmed against this host's
+ * own /nix/store glibc-dev <elf.h>, not assumed. Same four semantic
+ * roles as the aarch64/x86_64 sets above (R_386_32 is the ABS-equivalent
+ * addend-adding store, R_386_GLOB_DAT/JUMP_SLOT are addend-less GOT/PLT
+ * fixups, R_386_RELATIVE is a load-bias-only fixup) plus R_386_IRELATIVE,
+ * the identical ifunc-dispatch relocation the aarch64/x86_64 comments
+ * above already derive in full -- except that on i386 the addend for
+ * EVERY one of these is never a struct field (see this file's own
+ * "minimal local ELF32/ELF64 shapes" banner: i386 uses SHT_REL, not
+ * SHT_RELA) -- it is always read out of the relocated word itself by
+ * apply_reloc_table()'s own i386 branch before apply_one_reloc() ever
+ * sees it. */
+#define R_386_32          1
+#define R_386_GLOB_DAT    6
+#define R_386_JMP_SLOT    7
+#define R_386_RELATIVE    8
+#define R_386_IRELATIVE   42
 
 /* ---- sticky error state, single instance for this whole backend ----- */
 static char err_buf[256];
@@ -577,7 +774,7 @@ static const char main_handle_token;
  * "THREAD SAFETY" banner above for why pthread_once() specifically, not
  * a hand-rolled mutex. */
 static int self_symtab_ready;      /* 0 = not attempted, 1 = ready, -1 = failed permanently */
-static Elf64_Sym *self_syms;
+static Elf_Sym *self_syms;
 static char *self_strs;
 static size_t self_nsyms;
 static pthread_once_t self_symtab_once = PTHREAD_ONCE_INIT;
@@ -591,8 +788,8 @@ static pthread_once_t self_symtab_once = PTHREAD_ONCE_INIT;
 static void self_symtab_load_once(void)
 {
 	int fd = -1;
-	Elf64_Ehdr eh;
-	Elf64_Shdr *shdrs = NULL;
+	Elf_Ehdr eh;
+	Elf_Shdr *shdrs = NULL;
 	size_t shdr_bytes;
 	size_t i;
 	int symtab_idx = -1;
@@ -603,8 +800,8 @@ static void self_symtab_load_once(void)
 		goto fail;
 	}
 	if (pread(fd, &eh, sizeof eh, 0) != (ssize_t)sizeof eh ||
-	    eh.e_ident[EI_CLASS] != ELFCLASS64 || eh.e_ident[EI_DATA] != ELFDATA2LSB ||
-	    eh.e_shoff == 0 || eh.e_shnum == 0 || eh.e_shentsize != sizeof(Elf64_Shdr)) {
+	    eh.e_ident[EI_CLASS] != ELF_CLASS || eh.e_ident[EI_DATA] != ELFDATA2LSB ||
+	    eh.e_shoff == 0 || eh.e_shnum == 0 || eh.e_shentsize != sizeof(Elf_Shdr)) {
 		seterr("dlopen: /proc/self/exe has no usable ELF section header table");
 		goto fail;
 	}
@@ -630,10 +827,28 @@ static void self_symtab_load_once(void)
 	}
 
 	{
-		Elf64_Shdr *symtab_sh = &shdrs[symtab_idx];
-		Elf64_Shdr *strtab_sh = &shdrs[symtab_sh->sh_link];
-		size_t nsyms = symtab_sh->sh_size / sizeof(Elf64_Sym);
-		Elf64_Sym *syms = malloc(symtab_sh->sh_size);
+		Elf_Shdr *symtab_sh = &shdrs[symtab_idx];
+		Elf_Shdr *strtab_sh;
+		size_t nsyms;
+
+		/* symtab_sh->sh_link is the associated string table's OWN
+		 * section index, read straight out of the file -- unlike
+		 * symtab_idx just above (bounded by the `i < eh.e_shnum` loop
+		 * that found it), nothing had constrained sh_link to be a
+		 * valid index into `shdrs` at all before this fix: a running
+		 * binary with a corrupt or merely unusual .symtab section
+		 * header (sh_link pointing past e_shnum) turned this into a
+		 * genuine out-of-bounds read of `shdrs`, not a hypothetical
+		 * one -- caught by this file's own ownership-lint pass, which
+		 * could not prove strtab_sh's extent for exactly this reason.
+		 * Refuse cleanly instead of indexing past the array. */
+		if (symtab_sh->sh_link >= eh.e_shnum) {
+			seterr("dlopen: running binary's .symtab has an out-of-range sh_link");
+			goto fail;
+		}
+		strtab_sh = &shdrs[symtab_sh->sh_link];
+		nsyms = symtab_sh->sh_size / sizeof(Elf_Sym);
+		Elf_Sym *syms = malloc(symtab_sh->sh_size);
 		char *strs = malloc(strtab_sh->sh_size);
 
 		if (!syms || !strs) {
@@ -680,11 +895,17 @@ static void *resolve_main_symbol(const char *name)
 	size_t i;
 	if (self_symtab_load() != 0) return NULL;
 	for (i = 0; i < self_nsyms; i++) {
-		Elf64_Sym *s = &self_syms[i];
+		Elf_Sym *s = &self_syms[i];
 		if (s->st_shndx == SHN_UNDEF) continue;
 		if (s->st_name == 0) continue;
+		/* st_value is an ELF symbol table entry's own numeric field, an
+		 * already-absolute virtual address for a non-PIE main image --
+		 * ELF defines symbol values as integer addresses, and
+		 * reconstructing a pointer from one is this loader's own
+		 * required ABI operation, not something derivable from a
+		 * pointer anywhere in this translation unit. */
 		if (strcmp(self_strs + s->st_name, name) == 0)
-			return (void *)(uintptr_t)s->st_value; /* non-PIE: already absolute */
+			return unsafe_assume_valid_pointer((void *)(uintptr_t)s->st_value); /* non-PIE: already absolute */
 	}
 	return NULL;
 }
@@ -699,7 +920,7 @@ struct dlobj {
 	void *map_base;   /* the whole reservation, for munmap() */
 	size_t map_len;
 	unsigned long bias; /* ADDR(v) == bias + v, see __plat_dlopen() */
-	Elf64_Sym *dynsym;
+	Elf_Sym *dynsym;
 	char *dynstr;
 	size_t dynsym_count;
 	/* DT_NEEDED dependencies this object loaded, in DT_NEEDED order --
@@ -725,7 +946,12 @@ struct dlobj {
 
 #define ADDR(obj, v) ((void *)((obj)->bias + (uint64_t)(v)))
 
-static Elf64_Dyn *find_dyn_ptr(Elf64_Dyn *dyn, int64_t tag)
+/* dyn is always ADDR(obj, pt_dynamic->p_vaddr) -- a computed ELF-mapped
+ * address, never a possibly-failed allocation result -- at both call
+ * sites (run_ctors(), load_object()'s own dynamic-section-parsing
+ * block). */
+static Elf_Dyn *find_dyn_ptr(Elf_Dyn *dyn, int64_t tag) __attribute__((nonnull(1)));
+static Elf_Dyn *find_dyn_ptr(Elf_Dyn *dyn, int64_t tag)
 {
 	for (; dyn->d_tag != DT_NULL; dyn++)
 		if (dyn->d_tag == tag) return dyn;
@@ -747,13 +973,17 @@ static void *resolve_export(struct dlobj *obj, const char *name)
 {
 	size_t i;
 	for (i = 1; i < obj->dynsym_count; i++) {
-		Elf64_Sym *s = &obj->dynsym[i];
+		Elf_Sym *s = &obj->dynsym[i];
 		if (s->st_shndx == SHN_UNDEF) continue;
 		if (STB_LOCAL(s->st_info)) continue;
 		if (STV_VISIBILITY(s->st_other) != STV_DEFAULT &&
 		    STV_VISIBILITY(s->st_other) != STV_PROTECTED) continue;
+		/* ADDR() reconstructs a pointer from this object's real mapped
+		 * load bias plus an ELF-symbol-value virtual address -- see
+		 * apply_one_irelative() below for the full ADDR() reasoning,
+		 * shared by every call site in this file. */
 		if (strcmp(obj->dynstr + s->st_name, name) == 0)
-			return ADDR(obj, s->st_value);
+			return unsafe_assume_valid_pointer(ADDR(obj, s->st_value));
 	}
 	return NULL;
 }
@@ -800,9 +1030,15 @@ static void *resolve_via_deps(struct dlobj *obj, const char *name, int depth)
  * Returns 1 with *out filled on success, 0 on an unresolvable undefined
  * symbol (caller sets the sticky error with the symbol name for
  * context). */
+/* obj is always non-null: every call site is inside apply_one_reloc(),
+ * passing that function's own obj parameter (itself always non-null --
+ * see apply_one_reloc()'s own nonnull attribute below). out is always
+ * the address of a local variable at every call site, never NULL. */
+static int resolve_symref(struct dlobj *obj, uint32_t symidx, uint64_t *out)
+	__attribute__((nonnull(1, 3)));
 static int resolve_symref(struct dlobj *obj, uint32_t symidx, uint64_t *out)
 {
-	Elf64_Sym *sym;
+	Elf_Sym *sym;
 	const char *name;
 	void *addr;
 	if (symidx == 0 || symidx >= obj->dynsym_count) return 0;
@@ -844,7 +1080,7 @@ static int resolve_symref(struct dlobj *obj, uint32_t symidx, uint64_t *out)
 static unsigned int next_tls_module_id = 2;
 
 /* Must equal src/internal/linux/tls_setup.c's own
- * __ntlibc_linux_tls_block_create() initial DTV allocation size (the
+ * __spicule_linux_tls_block_create() initial DTV allocation size (the
  * real block builder crt/linux/crt1.c's linux_setup_tls() calls for the
  * initial thread, and src/thread/linux/plat_thread.c's
  * __plat_thread_spawn() calls for every later pthread_create()'d one)
@@ -867,12 +1103,14 @@ static int tls_dtv_ensure_capacity(unsigned int module_id)
 	void **tp = (void **)__builtin_thread_pointer();
 	void **old_dtv = *(void ***)tp;
 	void **new_dtv;
-	size_t new_capacity = dtv_capacity;
+	size_t new_capacity, new_bytes;
 
 	if ((size_t)module_id < dtv_capacity) return 0;
-	while ((size_t)module_id >= new_capacity) new_capacity *= 2;
+	if (!__array_next_capacity(dtv_capacity, (size_t)module_id, 1,
+	    TLS_DTV_INITIAL_CAPACITY, sizeof(void *), &new_capacity)) return -1;
 
-	new_dtv = malloc(new_capacity * sizeof(void *));
+	new_bytes = new_capacity * sizeof(void *); /* proven <= SIZE_MAX by __array_next_capacity's own element_size bound above */
+	new_dtv = malloc(new_bytes);
 	if (!new_dtv) return -1;
 	memcpy(new_dtv, old_dtv, dtv_capacity * sizeof(void *));
 	memset(new_dtv + dtv_capacity, 0, (new_capacity - dtv_capacity) * sizeof(void *));
@@ -928,14 +1166,14 @@ static int tls_dtv_ensure_capacity(unsigned int module_id)
  * disassembly above -- not the argument word's address). On return
  * x0 = (accessed address) - tpidr_el0 (the caller's own `add x0, x2,
  * x0` adds tpidr_el0 back). */
-extern void __ntlibc_tlsdesc_resolver(void);
+extern void __spicule_tlsdesc_resolver(void); // NOLINT(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp) -- implementation-reserved namespace, same as every other libc-internal symbol
 __asm__(
 "	.text\n"
 "	.align	2\n"
-"	.global	__ntlibc_tlsdesc_resolver\n"
-"	.hidden	__ntlibc_tlsdesc_resolver\n"
-"	.type	__ntlibc_tlsdesc_resolver, %function\n"
-"__ntlibc_tlsdesc_resolver:\n"
+"	.global	__spicule_tlsdesc_resolver\n"
+"	.hidden	__spicule_tlsdesc_resolver\n"
+"	.type	__spicule_tlsdesc_resolver, %function\n"
+"__spicule_tlsdesc_resolver:\n"
 "	stp	x1, x2, [sp, #-32]!\n"
 "	stp	x3, x4, [sp, #16]\n"
 "	ldr	x1, [x0, #8]\n"
@@ -950,7 +1188,7 @@ __asm__(
 "	ldp	x3, x4, [sp, #16]\n"
 "	ldp	x1, x2, [sp], #32\n"
 "	ret\n"
-"	.size	__ntlibc_tlsdesc_resolver, . - __ntlibc_tlsdesc_resolver\n"
+"	.size	__spicule_tlsdesc_resolver, . - __spicule_tlsdesc_resolver\n"
 );
 
 /* Build this object's own per-module TLS block (this object's own
@@ -962,7 +1200,7 @@ __asm__(
  * mapping) and before any relocation is applied (R_AARCH64_TLSDESC
  * relocations need obj->tls_module_id already assigned). Returns 0 on
  * success, -1 on failure (caller sets the sticky error). */
-static int setup_object_tls(struct dlobj *obj, const Elf64_Phdr *pt_tls)
+static int setup_object_tls(struct dlobj *obj, const Elf_Phdr *pt_tls)
 {
 	unsigned long data_align = pt_tls->p_align > 16 ? pt_tls->p_align : 16;
 	unsigned long alloc_size = TLS_TCB_HEADER_SIZE + pt_tls->p_memsz + data_align;
@@ -976,7 +1214,8 @@ static int setup_object_tls(struct dlobj *obj, const Elf64_Phdr *pt_tls)
 	data = block + TLS_TCB_HEADER_SIZE;
 	data = (unsigned char *)(((uintptr_t)data + data_align - 1) & ~(uintptr_t)(data_align - 1));
 
-	memcpy(data, ADDR(obj, pt_tls->p_vaddr), pt_tls->p_filesz);
+	/* ADDR() reconstruction -- see apply_one_irelative() below. */
+	memcpy(data, unsafe_assume_valid_pointer(ADDR(obj, pt_tls->p_vaddr)), pt_tls->p_filesz);
 	memset(data + pt_tls->p_filesz, 0, pt_tls->p_memsz - pt_tls->p_filesz);
 
 	modtcb = data - TLS_TCB_HEADER_SIZE; /* always >= block: data was rounded UP
@@ -1010,46 +1249,70 @@ static int setup_object_tls(struct dlobj *obj, const Elf64_Phdr *pt_tls)
 }
 #endif /* __aarch64__ */
 
-static int apply_one_reloc(struct dlobj *obj, const Elf64_Rela *r,
+/* A normalized relocation record: what apply_one_reloc()/apply_one_
+ * irelative() below actually need, decoupled from which of the two
+ * genuinely different on-disk relocation shapes it came from --
+ * Elf64_Rela (r_addend an explicit struct field, aarch64/x86_64) or
+ * Elf32_Rel (no r_addend field at all -- i386's addend is implicit,
+ * packed into the word already sitting at the relocation target; see
+ * this file's own "minimal local ELF32/ELF64 shapes" banner). apply_
+ * reloc_table()/apply_irelative_table() below are what build one of
+ * these per entry -- extracting r_addend explicitly for RELA, or
+ * reading it out of *loc for REL -- so this pair of functions can stay
+ * completely arch/format-agnostic about that split. */
+struct reloc {
+	uint64_t r_offset;
+	uint32_t r_sym;
+	uint32_t r_type;
+	int64_t r_addend;
+};
+
+/* obj and r are always non-null: this function's one call site
+ * (apply_reloc_table()'s own loop) passes that function's own obj
+ * parameter (see apply_reloc_table()'s matching nonnull attribute below)
+ * and &rec, the address of a local variable. */
+static int apply_one_reloc(struct dlobj *obj, const struct reloc *r,
+                            unsigned long lo, unsigned long hi)
+	__attribute__((nonnull(1, 2)));
+static int apply_one_reloc(struct dlobj *obj, const struct reloc *r,
                             unsigned long lo, unsigned long hi)
 {
-	uint32_t type = ELF64_R_TYPE(r->r_info);
-	uint64_t *loc;
+	unsigned long *loc;
 
 	if (r->r_offset < lo || r->r_offset >= hi) {
 		seterr("dlopen: relocation offset 0x%llx outside mapped object",
 		       (unsigned long long)r->r_offset);
 		return -1;
 	}
-	loc = ADDR(obj, r->r_offset);
+	/* ADDR() reconstruction -- see apply_one_irelative() below. Bounds
+	 * of r->r_offset are already proven inside [lo, hi) above. */
+	loc = unsafe_assume_valid_pointer(ADDR(obj, r->r_offset));
 
-	switch (type) {
+	switch (r->r_type) {
 #if defined(__aarch64__)
 	case R_AARCH64_RELATIVE:
-		*loc = obj->bias + (uint64_t)r->r_addend;
+		*loc = obj->bias + (unsigned long)r->r_addend;
 		return 0;
 	case R_AARCH64_ABS64:
 	case R_AARCH64_GLOB_DAT:
 	case R_AARCH64_JUMP_SLOT: {
 		uint64_t sym_addr;
-		uint32_t symidx = ELF64_R_SYM(r->r_info);
-		if (!resolve_symref(obj, symidx, &sym_addr)) {
-			const char *name = (symidx && symidx < obj->dynsym_count) ?
-				obj->dynstr + obj->dynsym[symidx].st_name : "?";
+		if (!resolve_symref(obj, r->r_sym, &sym_addr)) {
+			const char *name = (r->r_sym && r->r_sym < obj->dynsym_count) ?
+				obj->dynstr + obj->dynsym[r->r_sym].st_name : "?";
 			seterr("dlopen: undefined symbol: %s", name);
 			return -1;
 		}
-		*loc = sym_addr + (type == R_AARCH64_ABS64 ? (uint64_t)r->r_addend : 0);
+		*loc = (unsigned long)sym_addr + (r->r_type == R_AARCH64_ABS64 ? (unsigned long)r->r_addend : 0);
 		return 0;
 	}
 	case R_AARCH64_TLSDESC: {
-		/* See "TLS / per-library thread descriptors" (__ntlibc_tlsdesc_
+		/* See "TLS / per-library thread descriptors" (__spicule_tlsdesc_
 		 * resolver's own banner, above) for the two-word GOT-entry
 		 * shape and the (module_id, offset) packing this writes. */
-		uint32_t symidx = ELF64_R_SYM(r->r_info);
 		uint64_t module_id, offset;
 
-		if (symidx == 0) {
+		if (r->r_sym == 0) {
 			/* No symbol: the addend directly gives the offset within
 			 * THIS object's own PT_TLS segment -- the shape a `static
 			 * __thread` variable accessed from within the same .so
@@ -1062,12 +1325,12 @@ static int apply_one_reloc(struct dlobj *obj, const Elf64_Rela *r,
 			module_id = (uint64_t)obj->tls_module_id;
 			offset = (uint64_t)r->r_addend;
 		} else {
-			Elf64_Sym *sym;
-			if (symidx >= obj->dynsym_count) {
+			Elf_Sym *sym;
+			if (r->r_sym >= obj->dynsym_count) {
 				seterr("dlopen: TLSDESC relocation references an out-of-range symbol index");
 				return -1;
 			}
-			sym = &obj->dynsym[symidx];
+			sym = &obj->dynsym[r->r_sym];
 			if (sym->st_shndx == SHN_UNDEF) {
 				/* A TLS symbol DEFINED in another object (a dependency,
 				 * or the main image) -- cross-object TLS symbol
@@ -1089,8 +1352,8 @@ static int apply_one_reloc(struct dlobj *obj, const Elf64_Rela *r,
 			module_id = (uint64_t)obj->tls_module_id;
 			offset = sym->st_value + (uint64_t)r->r_addend;
 		}
-		loc[0] = (uint64_t)(uintptr_t)(void *)&__ntlibc_tlsdesc_resolver;
-		loc[1] = (module_id << 48) | (offset & 0xffffffffffffULL);
+		loc[0] = (unsigned long)(uintptr_t)(void *)&__spicule_tlsdesc_resolver;
+		loc[1] = (unsigned long)((module_id << 48) | (offset & 0xffffffffffffULL));
 		return 0;
 	}
 	case R_AARCH64_IRELATIVE:
@@ -1113,16 +1376,15 @@ static int apply_one_reloc(struct dlobj *obj, const Elf64_Rela *r,
 		return 0;
 #elif defined(__x86_64__)
 	case R_X86_64_RELATIVE:
-		*loc = obj->bias + (uint64_t)r->r_addend;
+		*loc = obj->bias + (unsigned long)r->r_addend;
 		return 0;
 	case R_X86_64_64:
 	case R_X86_64_GLOB_DAT:
 	case R_X86_64_JUMP_SLOT: {
 		uint64_t sym_addr;
-		uint32_t symidx = ELF64_R_SYM(r->r_info);
-		if (!resolve_symref(obj, symidx, &sym_addr)) {
-			const char *name = (symidx && symidx < obj->dynsym_count) ?
-				obj->dynstr + obj->dynsym[symidx].st_name : "?";
+		if (!resolve_symref(obj, r->r_sym, &sym_addr)) {
+			const char *name = (r->r_sym && r->r_sym < obj->dynsym_count) ?
+				obj->dynstr + obj->dynsym[r->r_sym].st_name : "?";
 			seterr("dlopen: undefined symbol: %s", name);
 			return -1;
 		}
@@ -1134,7 +1396,7 @@ static int apply_one_reloc(struct dlobj *obj, const Elf64_Rela *r,
 		 * therefore correct for all three types, not just R_X86_64_64,
 		 * since it is 0 for the other two anyway on any real linker's
 		 * output. */
-		*loc = sym_addr + (uint64_t)r->r_addend;
+		*loc = (unsigned long)sym_addr + (unsigned long)r->r_addend;
 		return 0;
 	}
 	case R_X86_64_IRELATIVE:
@@ -1143,6 +1405,32 @@ static int apply_one_reloc(struct dlobj *obj, const Elf64_Rela *r,
 		 * above, and apply_one_irelative()/apply_irelative_table()
 		 * further down for where this actually gets applied). */
 		return 0;
+#elif defined(__i386__)
+	case R_386_RELATIVE:
+		*loc = obj->bias + (unsigned long)r->r_addend;
+		return 0;
+	case R_386_32:
+	case R_386_GLOB_DAT:
+	case R_386_JMP_SLOT: {
+		uint64_t sym_addr;
+		if (!resolve_symref(obj, r->r_sym, &sym_addr)) {
+			const char *name = (r->r_sym && r->r_sym < obj->dynsym_count) ?
+				obj->dynstr + obj->dynsym[r->r_sym].st_name : "?";
+			seterr("dlopen: undefined symbol: %s", name);
+			return -1;
+		}
+		/* Same ABS-vs-addend-less split as aarch64's ABS64 vs. GLOB_DAT/
+		 * JUMP_SLOT above, not x86_64's "always add it, it's 0 anyway"
+		 * convention: the i386 psABI defines R_386_GLOB_DAT/JMP_SLOT's
+		 * own computation as plain "S" (the symbol's value, full stop),
+		 * with no addend term at all -- only R_386_32 is "S + A". */
+		*loc = (unsigned long)sym_addr + (r->r_type == R_386_32 ? (unsigned long)r->r_addend : 0);
+		return 0;
+	}
+	case R_386_IRELATIVE:
+		/* R_AARCH64_IRELATIVE's own i386 counterpart -- deferred for the
+		 * identical reason (see that case's own comment above). */
+		return 0;
 #endif
 	default:
 		/* Includes every TLS relocation type -- see this file's own
@@ -1150,22 +1438,65 @@ static int apply_one_reloc(struct dlobj *obj, const Elf64_Rela *r,
 		 * type we cannot correctly apply is the whole point of this
 		 * being a `default:` fail rather than an ignored case. */
 		seterr("dlopen: unsupported relocation type %u (offset 0x%llx) -- not yet implemented",
-		       type, (unsigned long long)r->r_offset);
+		       r->r_type, (unsigned long long)r->r_offset);
 		return -1;
 	}
 }
 
+/* obj is always non-null: both call sites, in load_object(), pass its
+ * own just-allocated obj. */
+static int apply_reloc_table(struct dlobj *obj, uint64_t tbl_vaddr, uint64_t tbl_size, // NOLINT(bugprone-easily-swappable-parameters) -- table address and size have distinct relocation roles
+                              unsigned long lo, unsigned long hi)
+	__attribute__((nonnull(1)));
 static int apply_reloc_table(struct dlobj *obj, uint64_t tbl_vaddr, uint64_t tbl_size, // NOLINT(bugprone-easily-swappable-parameters) -- table address and size have distinct relocation roles
                               unsigned long lo, unsigned long hi)
 {
+#if defined(__i386__)
+	Elf32_Rel *rels;
+	size_t count, i;
+	if (!tbl_vaddr || !tbl_size) return 0;
+	rels = ADDR(obj, tbl_vaddr);
+	count = tbl_size / sizeof(Elf32_Rel);
+	for (i = 0; i < count; i++) {
+		struct reloc rec;
+		int32_t *loc;
+		if (rels[i].r_offset < lo || rels[i].r_offset >= hi) {
+			seterr("dlopen: relocation offset 0x%llx outside mapped object",
+			       (unsigned long long)rels[i].r_offset);
+			return -1;
+		}
+		loc = ADDR(obj, rels[i].r_offset);
+		rec.r_offset = rels[i].r_offset;
+		rec.r_sym = ELF32_R_SYM(rels[i].r_info);
+		rec.r_type = ELF32_R_TYPE(rels[i].r_info);
+		/* SHT_REL: the addend is implicit, already sitting in the word
+		 * at the relocation target -- read BEFORE apply_one_reloc()
+		 * below overwrites *loc with the relocated value (see this
+		 * file's own "minimal local ELF32/ELF64 shapes" banner). */
+		rec.r_addend = *loc;
+		if (apply_one_reloc(obj, &rec, lo, hi) != 0) return -1;
+	}
+	return 0;
+#else
 	Elf64_Rela *relas;
 	size_t count, i;
 	if (!tbl_vaddr || !tbl_size) return 0;
-	relas = ADDR(obj, tbl_vaddr);
+	/* ADDR() reconstruction of the table base -- see
+	 * apply_one_irelative() below. No independent extent to check
+	 * beyond tbl_size, already required nonzero above and used only to
+	 * bound the loop count. */
+	relas = unsafe_assume_valid_pointer(ADDR(obj, tbl_vaddr));
 	count = tbl_size / sizeof(Elf64_Rela);
-	for (i = 0; i < count; i++)
-		if (apply_one_reloc(obj, &relas[i], lo, hi) != 0) return -1;
+	for (i = 0; i < count; i++) {
+		struct reloc rec;
+		rec.r_offset = relas[i].r_offset;
+		rec.r_sym = ELF64_R_SYM(relas[i].r_info);
+		rec.r_type = ELF64_R_TYPE(relas[i].r_info);
+		rec.r_addend = relas[i].r_addend;
+		if (apply_one_reloc(obj, &rec, lo, hi) != 0) return -1;
+	}
 	return 0;
+#endif
 }
 
 /* The second half of R_AARCH64_IRELATIVE/R_X86_64_IRELATIVE handling --
@@ -1184,17 +1515,25 @@ static int apply_reloc_table(struct dlobj *obj, uint64_t tbl_vaddr, uint64_t tbl
  * either applied it for real or already failed loudly on it during the
  * first pass, so a second, unrelated type showing up in the same table
  * is expected, not a new problem this pass needs to report again. */
-static int apply_one_irelative(struct dlobj *obj, const Elf64_Rela *r,
+/* obj and r are always non-null: this function's one call site
+ * (apply_irelative_table()'s own loop) passes that function's own obj
+ * parameter (see apply_irelative_table()'s matching nonnull attribute
+ * below) and &rec, the address of a local variable. */
+static int apply_one_irelative(struct dlobj *obj, const struct reloc *r,
+                                unsigned long lo, unsigned long hi)
+	__attribute__((nonnull(1, 2)));
+static int apply_one_irelative(struct dlobj *obj, const struct reloc *r,
                                 unsigned long lo, unsigned long hi)
 {
-	uint32_t type = ELF64_R_TYPE(r->r_info);
-	uint64_t *loc;
-	uint64_t (*resolver)(void);
+	unsigned long *loc;
+	unsigned long (*resolver)(void);
 
 #if defined(__aarch64__)
-	if (type != R_AARCH64_IRELATIVE) return 0;
+	if (r->r_type != R_AARCH64_IRELATIVE) return 0;
 #elif defined(__x86_64__)
-	if (type != R_X86_64_IRELATIVE) return 0;
+	if (r->r_type != R_X86_64_IRELATIVE) return 0;
+#elif defined(__i386__)
+	if (r->r_type != R_386_IRELATIVE) return 0;
 #else
 	return 0;
 #endif
@@ -1203,23 +1542,95 @@ static int apply_one_irelative(struct dlobj *obj, const Elf64_Rela *r,
 		       (unsigned long long)r->r_offset);
 		return -1;
 	}
-	loc = ADDR(obj, r->r_offset);
-	resolver = (uint64_t (*)(void))ADDR(obj, r->r_addend);
+	/* ADDR() reconstructs a pointer from this object's real mapped load
+	 * bias (obj->bias, set once when load_object() mmap()'d the image)
+	 * plus an ELF-relocation-computed virtual address; the same
+	 * bias+vaddr reconstruction apply_one_reloc()/apply_reloc_table()
+	 * already perform for every other relocation type (both marked the
+	 * same way, below), IRELATIVE entries just reach it through this
+	 * separate, later pass instead (see this function's own banner).
+	 * r->r_offset -- the relocation SLOT this yields the address of --
+	 * is proven inside [lo, hi) by the bounds check immediately above. */
+	loc = unsafe_assume_valid_pointer(ADDR(obj, r->r_offset));
+	/* Same ADDR() reconstruction as `loc` above, but keyed by a
+	 * DIFFERENT field (r_addend, the resolver's own address) that has
+	 * no equivalent bounds check available -- an ifunc resolver's
+	 * target isn't range-limited to the relocated object the way a
+	 * relocation slot is -- so this remains a human-justified ELF/ABI
+	 * assumption (the relocation's own r_addend, by R_*_IRELATIVE's
+	 * defined contract, holds resolver()'s runtime address), not a
+	 * provable range like `loc` above. */
+	resolver = unsafe_assume_valid_pointer(
+	    (unsigned long (*)(void))ADDR(obj, (unsigned long)r->r_addend));
 	*loc = resolver();
 	return 0;
 }
 
+/* obj is always non-null: both call sites, in load_object(), pass its
+ * own just-allocated obj. */
+static int apply_irelative_table(struct dlobj *obj, uint64_t tbl_vaddr, uint64_t tbl_size, // NOLINT(bugprone-easily-swappable-parameters) -- table address and size have distinct relocation roles
+                                  unsigned long lo, unsigned long hi)
+	__attribute__((nonnull(1)));
 static int apply_irelative_table(struct dlobj *obj, uint64_t tbl_vaddr, uint64_t tbl_size, // NOLINT(bugprone-easily-swappable-parameters) -- table address and size have distinct relocation roles
                                   unsigned long lo, unsigned long hi)
 {
+#if defined(__i386__)
+	Elf32_Rel *rels;
+	size_t count, i;
+	if (!tbl_vaddr || !tbl_size) return 0;
+	rels = ADDR(obj, tbl_vaddr);
+	count = tbl_size / sizeof(Elf32_Rel);
+	for (i = 0; i < count; i++) {
+		struct reloc rec;
+		int32_t *loc;
+		if (rels[i].r_offset < lo || rels[i].r_offset >= hi) {
+			seterr("dlopen: relocation offset 0x%llx outside mapped object",
+			       (unsigned long long)rels[i].r_offset);
+			return -1;
+		}
+		loc = ADDR(obj, rels[i].r_offset);
+		rec.r_offset = rels[i].r_offset;
+		rec.r_sym = ELF32_R_SYM(rels[i].r_info);
+		rec.r_type = ELF32_R_TYPE(rels[i].r_info);
+		/* Still the original implicit addend for an R_386_IRELATIVE
+		 * entry specifically -- apply_one_reloc()'s own R_386_IRELATIVE
+		 * case (via apply_reloc_table() above) deliberately left THIS
+		 * type's own slot untouched in the first pass, exactly as it
+		 * does for R_AARCH64_IRELATIVE/R_X86_64_IRELATIVE (see that
+		 * case's own comment). Every other type's slot already holds
+		 * its real relocated value by now, not an addend at all -- but
+		 * apply_one_irelative() below discards rec.r_addend unread for
+		 * any type other than R_386_IRELATIVE, so that is harmless. */
+		rec.r_addend = *loc;
+		if (apply_one_irelative(obj, &rec, lo, hi) != 0) return -1;
+	}
+	return 0;
+#else
 	Elf64_Rela *relas;
 	size_t count, i;
 	if (!tbl_vaddr || !tbl_size) return 0;
-	relas = ADDR(obj, tbl_vaddr);
+	/* tbl_vaddr is DT_JMPREL/an irelative-table PT_DYNAMIC entry's own
+	 * link-time virtual address; ADDR() reconstructs its runtime
+	 * location the same way every other section/table address in this
+	 * loader does, from obj->bias (this object's real, already-mapped
+	 * load bias) plus that ELF-declared vaddr. Every element this table
+	 * yields is separately bounds-checked against [lo, hi) inside the
+	 * loop below (r->r_offset, see apply_one_irelative()) before use;
+	 * the table base itself has no independent extent to check beyond
+	 * tbl_size, already required nonzero above and used only to bound
+	 * the loop count. */
+	relas = unsafe_assume_valid_pointer(ADDR(obj, tbl_vaddr));
 	count = tbl_size / sizeof(Elf64_Rela);
-	for (i = 0; i < count; i++)
-		if (apply_one_irelative(obj, &relas[i], lo, hi) != 0) return -1;
+	for (i = 0; i < count; i++) {
+		struct reloc rec;
+		rec.r_offset = relas[i].r_offset;
+		rec.r_sym = ELF64_R_SYM(relas[i].r_info);
+		rec.r_type = ELF64_R_TYPE(relas[i].r_info);
+		rec.r_addend = relas[i].r_addend;
+		if (apply_one_irelative(obj, &rec, lo, hi) != 0) return -1;
+	}
 	return 0;
+#endif
 }
 
 /* DT_INIT (if present), then every DT_INIT_ARRAY entry in file order --
@@ -1232,19 +1643,28 @@ static int apply_irelative_table(struct dlobj *obj, uint64_t tbl_vaddr, uint64_t
  * every struct dlobj this file ever creates gets its constructors run
  * exactly once, at the end of the one load_object() call that created
  * it. */
-static void run_ctors(struct dlobj *obj, Elf64_Dyn *dyn)
+static void run_ctors(struct dlobj *obj, Elf_Dyn *dyn)
 {
-	Elf64_Dyn *d_init = find_dyn_ptr(dyn, DT_INIT);
-	Elf64_Dyn *d_init_array = find_dyn_ptr(dyn, DT_INIT_ARRAY);
-	Elf64_Dyn *d_init_arraysz = find_dyn_ptr(dyn, DT_INIT_ARRAYSZ);
+	Elf_Dyn *d_init = find_dyn_ptr(dyn, DT_INIT);
+	Elf_Dyn *d_init_array = find_dyn_ptr(dyn, DT_INIT_ARRAY);
+	Elf_Dyn *d_init_arraysz = find_dyn_ptr(dyn, DT_INIT_ARRAYSZ);
 
 	if (d_init) {
-		void (*init_fn)(void) = (void (*)(void))ADDR(obj, d_init->d_val);
+		/* ADDR() reconstruction -- see apply_one_irelative() below. */
+		void (*init_fn)(void) =
+		    unsafe_assume_valid_pointer((void (*)(void))ADDR(obj, d_init->d_val));
 		init_fn();
 	}
 	if (d_init_array && d_init_arraysz) {
-		uint64_t *arr = ADDR(obj, d_init_array->d_val);
-		size_t count = d_init_arraysz->d_val / sizeof(uint64_t);
+		/* uintptr_t-sized entries, NOT hardcoded uint64_t: a real
+		 * .init_array entry is one pointer-width word wide on its own
+		 * architecture, which is 4 bytes on i386 -- the same "loc must
+		 * track the target's own native word size, not a hardcoded 64
+		 * bits" reasoning apply_one_reloc()'s own `unsigned long *loc`
+		 * follows. ADDR() reconstruction of the array base itself --
+		 * see apply_one_irelative() below. */
+		uintptr_t *arr = unsafe_assume_valid_pointer(ADDR(obj, d_init_array->d_val));
+		size_t count = d_init_arraysz->d_val / sizeof(uintptr_t);
 		size_t i;
 		for (i = 0; i < count; i++) {
 			/* Each slot already holds an absolute, post-relocation
@@ -1255,8 +1675,13 @@ static void run_ctors(struct dlobj *obj, Elf64_Dyn *dyn)
 			 * applied by apply_reloc_table() above, like any other
 			 * data pointer (confirmed against this file's own test
 			 * fixture) -- NOT a link-time vaddr this function itself
-			 * would need to re-bias through ADDR(). */
-			void (*fn)(void) = (void (*)(void))(uintptr_t)arr[i];
+			 * would need to re-bias through ADDR(). The relocation
+			 * pass that established this ran in a DIFFERENT function
+			 * (apply_reloc_table(), earlier in load_object()'s own
+			 * sequence), an invariant this function's own body cannot
+			 * see. */
+			void (*fn)(void) =
+			    unsafe_assume_valid_pointer((void (*)(void))(uintptr_t)arr[i]);
 			fn();
 		}
 	}
@@ -1279,30 +1704,75 @@ static void run_ctors(struct dlobj *obj, Elf64_Dyn *dyn)
  * wanting DT_RPATH/DT_RUNPATH/LD_LIBRARY_PATH/an ldconfig-style cache
  * can build all of that on top of this same open_needed() call site
  * later; nothing above it needs to change. */
-static void dirname_of(const char *path, char *buf, size_t bufsz)
+/* path required (nonnull, and null_terminated -- its one real call site,
+ * load_object(), passes load_object()'s own file parameter, itself
+ * withtok(null_terminated), see that function's own declaration).  buf
+ * is an out parameter: uninitialized on entry, always left holding a
+ * genuine null-terminated string on return (both exit paths below store
+ * a literal NUL; unsafe_assume_string_terminated() restates each as an
+ * axiom the same way put_field()/strcpy() do for their own raw stores,
+ * since a raw indexed store is not something this checker's syntactic
+ * walk proves on its own). */
+static void dirname_of(const char *path withtok(null_terminated),
+                        char *buf grant(null_terminated), size_t bufsz)
+	__attribute__((nonnull(1, 2)));
+static void dirname_of(const char *path withtok(null_terminated),
+                        char *buf grant(null_terminated), size_t bufsz)
 {
 	const char *slash = strrchr(path, '/');
 	size_t len, i;
-	if (!slash) { buf[0] = 0; return; }
+	if (!slash) {
+		buf[0] = 0;
+		unsafe_assume_string_terminated(buf);
+		return;
+	}
 	len = (size_t)(slash - path) + 1; /* keep the slash itself */
 	if (len >= bufsz) len = bufsz - 1;
 	for (i = 0; i < len; i++) buf[i] = path[i];
 	buf[len] = 0;
+	unsafe_assume_string_terminated(buf);
 }
 
-static int open_needed(const char *dir, const char *name, char *pathbuf, size_t pathbuf_sz)
+/* dir is deliberately NOT withtok(null_terminated)/nonnull: this function
+ * itself supports a NULL dir (the `dir &&` guard just below), even though
+ * this file's own one call site always happens to pass a real buffer --
+ * a future caller with no directory to search is exactly the shape this
+ * parameter already exists to support. name is always a genuine
+ * null-terminated string at that call site (see load_object()'s own
+ * needed_name axiom); pathbuf is an out parameter, uninitialized on
+ * entry and always left null-terminated by the time any successful
+ * return is reached (see the two unsafe_assume_string_terminated() calls
+ * below) -- the one early failure return (ENAMETOOLONG) leaves it
+ * untouched, which is fine, since load_object()'s own caller never reads
+ * pathbuf after a negative return. */
+static int open_needed(const char *dir, const char *name withtok(null_terminated),
+                        char *pathbuf grant(null_terminated), size_t pathbuf_sz)
+	__attribute__((nonnull(2, 3)));
+static int open_needed(const char *dir, const char *name withtok(null_terminated),
+                        char *pathbuf grant(null_terminated), size_t pathbuf_sz)
 {
 	int fd = -1;
 	if (dir && dir[0] && strlen(dir) + strlen(name) < pathbuf_sz) {
 		(void)snprintf(pathbuf, pathbuf_sz, "%s%s", dir, name);
+		/* snprintf() with a nonzero size (pathbuf_sz here) always
+		 * NUL-terminates its output buffer (C11 7.21.6.5p2), true by
+		 * construction and not otherwise visible to the checker
+		 * across this call -- same restatement put_field() (src/util/
+		 * ar.c) already makes for its own snprintf() call. */
+		unsafe_assume_string_terminated(pathbuf);
 		fd = open(pathbuf, O_RDONLY);
 	}
-	if (fd < 0 && strlen(name) < pathbuf_sz) {
+	if (fd >= 0) return fd;
+	if (strlen(name) >= pathbuf_sz) { errno = ENAMETOOLONG; return -1; }
+	{
 		size_t i, length = strlen(name);
 		for (i = 0; i <= length; i++) pathbuf[i] = name[i];
-		fd = open(name, O_RDONLY);
+		/* The loop above copies name[length] == name's own NUL
+		 * terminator (length == strlen(name)) into pathbuf -- true by
+		 * construction, not provable from a raw indexed-copy loop. */
+		unsafe_assume_string_terminated(pathbuf);
 	}
-	return fd;
+	return open(name, O_RDONLY);
 }
 
 /* ---- dependency-tree bookkeeping --------------------------------------
@@ -1313,9 +1783,18 @@ static int open_needed(const char *dir, const char *name, char *pathbuf, size_t 
  * is shared or reference-counted, so there is exactly one owner and
  * closing (or failing to fully build) it must tear down everything
  * underneath it too. */
+/* obj and dep are always non-null: this function's one call site, in
+ * load_object(), passes its own just-allocated obj and dep (already
+ * checked `if (!dep) goto fail;` immediately after the recursive
+ * load_object() call that produced it, and before this call). */
+static int add_dep(struct dlobj *obj, struct dlobj *dep)
+	__attribute__((nonnull(1, 2)));
 static int add_dep(struct dlobj *obj, struct dlobj *dep)
 {
-	struct dlobj **grown = realloc(obj->deps, (obj->ndeps + 1) * sizeof *grown);
+	struct dlobj **grown;
+	size_t ndeps;
+	if (!__size_add_checked(obj->ndeps, 1, &ndeps)) return -1;
+	grown = reallocarray(obj->deps, ndeps, sizeof *grown); // NOLINT(bugprone-sizeof-expression) -- grown is dlobj**, *grown is dlobj*, the array holds pointers
 	if (!grown) return -1;
 	grown[obj->ndeps] = dep;
 	obj->deps = grown;
@@ -1362,15 +1841,23 @@ static void teardown_obj(struct dlobj *obj)
  * thin wrapper: MAIN_IMAGE_HANDLE's special-casing and the RTLD_* `mode`
  * parameter both belong to the PUBLIC entry point, not to this internal
  * one. */
-static struct dlobj *load_object(const char *file, int depth)
+/* file required (nonnull, and null_terminated): __plat_dlopen() below
+ * establishes the axiom on its own file parameter (a real fact, per
+ * dlopen()'s own POSIX contract that a non-NULL file names a real
+ * pathname string) right before its one top-level call here, and the
+ * recursive call further down passes open_needed()'s own pathbuf out
+ * parameter, itself grant(null_terminated). */
+static struct dlobj *load_object(const char *file withtok(null_terminated), int depth)
+	__attribute__((nonnull(1)));
+static struct dlobj *load_object(const char *file withtok(null_terminated), int depth)
 {
 	int fd = -1;
-	Elf64_Ehdr eh;
-	Elf64_Phdr *phdrs = NULL;
+	Elf_Ehdr eh;
+	Elf_Phdr *phdrs = NULL;
 	size_t phdr_bytes;
-	Elf64_Phdr *pt_dynamic = NULL;
-	Elf64_Phdr *pt_tls = NULL;
-	Elf64_Phdr *pt_relro = NULL;
+	Elf_Phdr *pt_dynamic = NULL;
+	Elf_Phdr *pt_tls = NULL;
+	Elf_Phdr *pt_relro = NULL;
 	unsigned long lo = (unsigned long)-1, hi = 0;
 	void *map_base = MAP_FAILED;
 	size_t map_len = 0;
@@ -1400,8 +1887,8 @@ static struct dlobj *load_object(const char *file, int depth)
 
 	if (pread(fd, &eh, sizeof eh, 0) != (ssize_t)sizeof eh ||
 	    memcmp(eh.e_ident, "\x7f""ELF", 4) != 0 ||
-	    eh.e_ident[EI_CLASS] != ELFCLASS64 || eh.e_ident[EI_DATA] != ELFDATA2LSB) {
-		seterr("dlopen: %s: not a recognizable ELF64 file", file);
+	    eh.e_ident[EI_CLASS] != ELF_CLASS || eh.e_ident[EI_DATA] != ELFDATA2LSB) {
+		seterr("dlopen: %s: not a recognizable ELF file for this architecture", file);
 		errno = ENOEXEC;
 		goto fail;
 	}
@@ -1417,13 +1904,19 @@ static struct dlobj *load_object(const char *file, int depth)
 		errno = ENOEXEC;
 		goto fail;
 	}
+#elif defined(__i386__)
+	if (eh.e_machine != EM_386) {
+		seterr("dlopen: %s: wrong machine type (this build only supports EM_386=%d, see this file's own banner)", file, EM_386);
+		errno = ENOEXEC;
+		goto fail;
+	}
 #endif
 	if (eh.e_type != ET_DYN) {
 		seterr("dlopen: %s: not ET_DYN (only shared objects are supported)", file);
 		errno = ENOEXEC;
 		goto fail;
 	}
-	if (eh.e_phnum == 0 || eh.e_phnum > 256 || eh.e_phentsize != sizeof(Elf64_Phdr)) {
+	if (eh.e_phnum == 0 || eh.e_phnum > 256 || eh.e_phentsize != sizeof(Elf_Phdr)) {
 		seterr("dlopen: %s: unusable program header table", file);
 		errno = ENOEXEC;
 		goto fail;
@@ -1440,7 +1933,7 @@ static struct dlobj *load_object(const char *file, int depth)
 	}
 
 	for (i = 0; i < eh.e_phnum; i++) {
-		Elf64_Phdr *ph = &phdrs[i];
+		Elf_Phdr *ph = &phdrs[i];
 		if (ph->p_type == PT_TLS) {
 #if defined(__aarch64__)
 			/* Per-object TLS is implemented for aarch64 -- see this
@@ -1503,7 +1996,7 @@ static struct dlobj *load_object(const char *file, int depth)
 	 * NOT a relro-hardening pass, just restoring the object's own
 	 * declared (non-relro) permissions. */
 	for (i = 0; i < eh.e_phnum; i++) {
-		Elf64_Phdr *ph = &phdrs[i];
+		Elf_Phdr *ph = &phdrs[i];
 		unsigned long vstart, filelen, memend, alloclen;
 		void *segbase;
 		if (ph->p_type != PT_LOAD) continue;
@@ -1511,7 +2004,11 @@ static struct dlobj *load_object(const char *file, int depth)
 		vstart = pgdown(ph->p_vaddr);
 		filelen = pgup((ph->p_vaddr - vstart) + ph->p_filesz);
 		memend = pgup((ph->p_vaddr - vstart) + ph->p_memsz);
-		segbase = (void *)(obj->bias + vstart);
+		/* Same bias+vaddr reconstruction as ADDR() -- see
+		 * apply_one_irelative() below -- just not spelled through that
+		 * macro since vstart is already page-aligned, not a raw
+		 * ELF-declared vaddr. */
+		segbase = unsafe_assume_valid_pointer((void *)(obj->bias + vstart));
 
 		if (ph->p_filesz > 0) {
 			void *r = raw_mmap(segbase, filelen, PROT_READ | PROT_WRITE,
@@ -1531,10 +2028,9 @@ static struct dlobj *load_object(const char *file, int depth)
 			 * the file's real length, not at p_filesz specifically --
 			 * writing it explicitly costs nothing and does not depend
 			 * on that distinction lining up. */
-			{
-				size_t i = (size_t)((ph->p_vaddr - vstart) + ph->p_filesz);
-				for (; i < filelen; i++) ((char *)segbase)[i] = 0;
-			}
+			for (size_t tailoff = (size_t)((ph->p_vaddr - vstart) + ph->p_filesz);
+			     tailoff < filelen; tailoff++)
+				((char *)segbase)[tailoff] = 0;
 		}
 		alloclen = memend > filelen ? memend : filelen;
 		if (alloclen > filelen) {
@@ -1561,42 +2057,56 @@ static struct dlobj *load_object(const char *file, int depth)
 #endif
 
 	{
-		Elf64_Dyn *dyn = ADDR(obj, pt_dynamic->p_vaddr);
-		Elf64_Dyn *d_hash = find_dyn_ptr(dyn, DT_HASH);
-		Elf64_Dyn *d_symtab = find_dyn_ptr(dyn, DT_SYMTAB);
-		Elf64_Dyn *d_strtab = find_dyn_ptr(dyn, DT_STRTAB);
-		Elf64_Dyn *d_syment = find_dyn_ptr(dyn, DT_SYMENT);
-		Elf64_Dyn *d_rela = find_dyn_ptr(dyn, DT_RELA);
-		Elf64_Dyn *d_relasz = find_dyn_ptr(dyn, DT_RELASZ);
-		Elf64_Dyn *d_relaent = find_dyn_ptr(dyn, DT_RELAENT);
-		Elf64_Dyn *d_jmprel = find_dyn_ptr(dyn, DT_JMPREL);
-		Elf64_Dyn *d_pltrelsz = find_dyn_ptr(dyn, DT_PLTRELSZ);
-		Elf64_Dyn *d_pltrel = find_dyn_ptr(dyn, DT_PLTREL);
+		/* ADDR() reconstruction -- see apply_one_irelative() below. */
+		Elf_Dyn *dyn = unsafe_assume_valid_pointer(ADDR(obj, pt_dynamic->p_vaddr));
+		Elf_Dyn *d_hash = find_dyn_ptr(dyn, DT_HASH);
+		Elf_Dyn *d_symtab = find_dyn_ptr(dyn, DT_SYMTAB);
+		Elf_Dyn *d_strtab = find_dyn_ptr(dyn, DT_STRTAB);
+		Elf_Dyn *d_syment = find_dyn_ptr(dyn, DT_SYMENT);
+		Elf_Dyn *d_rela = find_dyn_ptr(dyn, DT_REL_TAG);
+		Elf_Dyn *d_relasz = find_dyn_ptr(dyn, DT_RELSZ_TAG);
+		Elf_Dyn *d_relaent = find_dyn_ptr(dyn, DT_RELENT_TAG);
+		Elf_Dyn *d_jmprel = find_dyn_ptr(dyn, DT_JMPREL);
+		Elf_Dyn *d_pltrelsz = find_dyn_ptr(dyn, DT_PLTRELSZ);
+		Elf_Dyn *d_pltrel = find_dyn_ptr(dyn, DT_PLTREL);
 
 		if (!d_hash || !d_symtab || !d_strtab || !d_syment) {
 			seterr("dlopen: %s: no DT_HASH/DT_SYMTAB/DT_STRTAB -- DT_GNU_HASH-only objects are not supported yet (see this file's own banner); relink with -Wl,--hash-style=sysv or =both", file);
 			goto fail;
 		}
-		if (d_syment->d_val != sizeof(Elf64_Sym)) {
+		if (d_syment->d_val != sizeof(Elf_Sym)) {
 			seterr("dlopen: %s: unexpected DT_SYMENT", file);
 			goto fail;
 		}
+#if defined(__i386__)
+		if (d_relaent && d_relaent->d_val != sizeof(Elf32_Rel)) {
+			seterr("dlopen: %s: unexpected DT_RELENT", file);
+			goto fail;
+		}
+#else
 		if (d_relaent && d_relaent->d_val != sizeof(Elf64_Rela)) {
 			seterr("dlopen: %s: unexpected DT_RELAENT", file);
 			goto fail;
 		}
-		if (d_pltrel && d_pltrel->d_val != DT_RELA) {
-			seterr("dlopen: %s: DT_PLTREL is not DT_RELA (REL-style PLT relocations are not supported)", file);
+#endif
+		if (d_pltrel && d_pltrel->d_val != DT_REL_TAG) {
+			seterr("dlopen: %s: DT_PLTREL does not match this object's own main relocation format", file);
 			goto fail;
 		}
 
-		obj->dynsym = ADDR(obj, d_symtab->d_val);
-		obj->dynstr = ADDR(obj, d_strtab->d_val);
+		/* ADDR() reconstruction, twice -- see apply_one_irelative()
+		 * below. */
+		obj->dynsym = unsafe_assume_valid_pointer(ADDR(obj, d_symtab->d_val));
+		obj->dynstr = unsafe_assume_valid_pointer(ADDR(obj, d_strtab->d_val));
 		/* DT_HASH's header is { nbucket; nchain; ... } -- nchain equals
 		 * the symbol table's own entry count by the SysV ELF hash
 		 * table's own specification, giving an exact count with no
-		 * GNU-hash bucket walk needed. */
-		obj->dynsym_count = ((uint32_t *)(uintptr_t)(obj->bias + d_hash->d_val))[1];
+		 * GNU-hash bucket walk needed. Same bias+vaddr reconstruction
+		 * as ADDR(), just not spelled through that macro since the
+		 * result is immediately dereferenced rather than stored as a
+		 * pointer. */
+		obj->dynsym_count = unsafe_assume_valid_pointer(
+		    (uint32_t *)(uintptr_t)(obj->bias + d_hash->d_val))[1];
 
 		/* ---- DT_NEEDED: load every dependency fresh, within this
 		 * object's own namespace -- see this file's "NAMESPACE
@@ -1607,7 +2117,7 @@ static struct dlobj *load_object(const char *file, int depth)
 		 * the recursive load_object() call below) needs to run before
 		 * THIS object's own constructors do. */
 		{
-			Elf64_Dyn *walk;
+			Elf_Dyn *walk;
 			char dir[4096];
 			dirname_of(file, dir, sizeof dir);
 			for (walk = dyn; walk->d_tag != DT_NULL; walk++) {
@@ -1617,6 +2127,16 @@ static struct dlobj *load_object(const char *file, int depth)
 				const char *needed_name;
 				if (walk->d_tag != DT_NEEDED) continue;
 				needed_name = obj->dynstr + walk->d_val;
+				/* obj->dynstr is DT_STRTAB's own mapped base; every
+				 * DT_NEEDED d_val is an offset into it, and the ELF
+				 * specification defines a string table's own contents
+				 * as a sequence of NUL-terminated strings -- the same
+				 * class of "trust the file format, not just the
+				 * bytes a raw loop touched" fact resolve_export()'s
+				 * own ADDR() reconstructions already rely on
+				 * throughout this file, just restated here as an
+				 * axiom since open_needed() below requires it. */
+				unsafe_assume_string_terminated(needed_name);
 				nfd = open_needed(dir, needed_name, pathbuf, sizeof pathbuf);
 				if (nfd < 0) {
 					seterr("dlopen: %s: cannot find DT_NEEDED dependency \"%s\": %s (searched \"%s\" and the bare name -- no DT_RPATH/DT_RUNPATH/LD_LIBRARY_PATH support, see this file's own DT_NEEDED banner)",
@@ -1649,7 +2169,7 @@ static struct dlobj *load_object(const char *file, int depth)
 	 * protection now that every relocation, wherever it targeted, has
 	 * been applied. */
 	for (i = 0; i < eh.e_phnum; i++) {
-		Elf64_Phdr *ph = &phdrs[i];
+		Elf_Phdr *ph = &phdrs[i];
 		unsigned long vstart, memend;
 		int prot;
 		if (ph->p_type != PT_LOAD) continue;
@@ -1659,7 +2179,12 @@ static struct dlobj *load_object(const char *file, int depth)
 		       (ph->p_flags & PF_W ? PROT_WRITE : 0) |
 		       (ph->p_flags & PF_X ? PROT_EXEC : 0);
 		if (prot & PROT_WRITE) continue; /* already mapped read-write */
-		if (raw_mprotect((void *)(obj->bias + vstart), memend, prot) != 0) {
+		/* Same bias+vaddr reconstruction as ADDR() -- see
+		 * apply_one_irelative() below -- just not spelled through that
+		 * macro since vstart is already page-aligned, not a raw
+		 * ELF-declared vaddr. */
+		if (raw_mprotect(unsafe_assume_valid_pointer((void *)(obj->bias + vstart)),
+		                 memend, prot) != 0) {
 			seterr("dlopen: %s: cannot finalize protection on segment %u: %s", file, i, strerror(errno));
 			goto fail;
 		}
@@ -1699,8 +2224,11 @@ static struct dlobj *load_object(const char *file, int depth)
 	if (pt_relro) {
 		unsigned long relro_lo = pgdown(pt_relro->p_vaddr);
 		unsigned long relro_hi = pgdown(pt_relro->p_vaddr + pt_relro->p_memsz);
+		/* Same bias+vaddr reconstruction as segbase/raw_mprotect(vstart)
+		 * above -- see apply_one_irelative() below. */
 		if (relro_hi > relro_lo &&
-		    raw_mprotect((void *)(obj->bias + relro_lo), relro_hi - relro_lo, PROT_READ) != 0) {
+		    raw_mprotect(unsafe_assume_valid_pointer((void *)(obj->bias + relro_lo)),
+		                 relro_hi - relro_lo, PROT_READ) != 0) {
 			seterr("dlopen: %s: cannot apply PT_GNU_RELRO protection: %s", file, strerror(errno));
 			goto fail;
 		}
@@ -1708,7 +2236,8 @@ static struct dlobj *load_object(const char *file, int depth)
 
 	/* DT_INIT/DT_INIT_ARRAY -- see run_ctors()'s own banner for exactly
 	 * why this runs last, after every other step above has finished. */
-	run_ctors(obj, ADDR(obj, pt_dynamic->p_vaddr));
+	/* ADDR() reconstruction -- see apply_one_irelative() below. */
+	run_ctors(obj, unsafe_assume_valid_pointer(ADDR(obj, pt_dynamic->p_vaddr)));
 
 	free(phdrs);
 	(void)close(fd);
@@ -1744,6 +2273,14 @@ void *__plat_dlopen(const char *file, int mode)
 	             * backend for its own, different reasons. */
 
 	if (!file) return MAIN_IMAGE_HANDLE;
+	/* file is non-NULL here, and dlopen()'s own POSIX contract requires
+	 * a non-NULL file to name a real pathname string -- true by that
+	 * contract, not otherwise visible to the checker across the public
+	 * dlfcn.c/plat_dlfcn.h boundary this parameter crosses. Established
+	 * only in this branch (never for the NULL/MAIN_IMAGE_HANDLE case
+	 * just above), the same conditional-axiom shape src/env/getenv.c's
+	 * own `if (result) unsafe_assume_string_terminated(result);` uses. */
+	unsafe_assume_string_terminated(file);
 	return load_object(file, 0);
 }
 

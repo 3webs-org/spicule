@@ -85,6 +85,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
@@ -111,6 +112,7 @@ static void put_field(char *field, size_t width, const char *fmt, long value)
 	char tmp[32];
 	size_t len;
 	snprintf(tmp, sizeof tmp, fmt, value);
+	unsafe_assume_string_terminated(tmp);
 	len = strlen(tmp);
 	if (len > width) len = width; /* callers keep values in range */
 	memset(field, ' ', width);
@@ -122,7 +124,12 @@ static void put_field(char *field, size_t width, const char *fmt, long value)
 static int write_header(FILE *out, const struct ar_member *m)
 {
 	char hdr[AR_HDR_LEN];
-	size_t nl = strlen(m->name);
+	size_t nl;
+	/* m->name is always NUL-terminated: build_member()'s strcpy() from a
+	 * basename already checked to fit, or parse_header()'s explicit
+	 * m->name[AR_NAME_MAX] = 0. */
+	unsafe_assume_string_terminated(m->name);
+	nl = strlen(m->name);
 
 	memset(hdr, ' ', sizeof hdr);
 	for (size_t i = 0; i < nl; i++) hdr[i] = m->name[i];
@@ -141,8 +148,20 @@ static int write_header(FILE *out, const struct ar_member *m)
 
 /* Parses one already-read 60-byte header. Returns 0 on a structurally
  * valid header (name may still be empty for a foreign long-name/symtab
- * member -- see below), or -1 if the trailing "`\n" magic is wrong,
- * meaning the archive is corrupt or desynchronized. */
+ * member -- see below), or -1 if the magic is wrong, the name embeds a
+ * path separator, or the size field over/underflows `long`.
+ *
+ * The name check blocks a "Zip Slip"-style path traversal: a crafted
+ * name like "../../evil" fits the 15-byte field and would otherwise
+ * reach fopen() unchecked in x_visit().
+ *
+ * The size check matters because the field is a 10-byte decimal string
+ * that can claim up to 9999999999, past LONG_MAX on this project's
+ * 32-bit-`long` Windows target; strtol() clamps rather than wraps, but
+ * the caller's `m.size + (m.size & 1)` padding arithmetic can then
+ * itself overflow. A leading '-' would also desync the walk by
+ * "skipping" a negative amount. Rejecting both here is simpler than
+ * making that arithmetic overflow-safe. */
 static int parse_header(const char raw[AR_HDR_LEN], struct ar_member *m)
 {
 	char field[17];
@@ -156,10 +175,17 @@ static int parse_header(const char raw[AR_HDR_LEN], struct ar_member *m)
 	if (i >= 0 && field[i] == '/') field[i] = 0;
 	strncpy(m->name, field, AR_NAME_MAX);
 	m->name[AR_NAME_MAX] = 0;
+	unsafe_assume_string_terminated(m->name);
+	if (strchr(m->name, '/') || strchr(m->name, '\\')) return -1;
 
 	memcpy(field, raw + 16, 12); field[12] = 0; m->mtime = strtol(field, NULL, 10);
 	memcpy(field, raw + 40, 8); field[8] = 0; m->mode = strtol(field, NULL, 8);
-	memcpy(field, raw + 48, 10); field[10] = 0; m->size = strtol(field, NULL, 10);
+	memcpy(field, raw + 48, 10); field[10] = 0;
+	errno = 0;
+	m->size = strtol(field, NULL, 10);
+	/* Reject LONG_MAX itself too: it's odd, so the caller's even-padding
+	 * `+ (m.size & 1)` would overflow even for this in-range value. */
+	if (m->size < 0 || errno == ERANGE || m->size >= LONG_MAX) return -1;
 	return 0;
 }
 
@@ -189,7 +215,7 @@ static int ar_foreach(const char *path, ar_visit_fn visit, void *ctx)
 	if (fread(magic, 1, AR_MAGIC_LEN, ar) != AR_MAGIC_LEN ||
 	    memcmp(magic, AR_MAGIC, AR_MAGIC_LEN) != 0) {
 		__util_diagf("ar: %s: not an archive (bad magic)\n", path);
-		fclose(ar);
+		(void)fclose(ar);
 		return -1;
 	}
 
@@ -211,10 +237,8 @@ static int ar_foreach(const char *path, ar_visit_fn visit, void *ctx)
 		}
 		data_off = ftell(ar);
 		if (m.name[0] == 0) {
-			/* A foreign special member (GNU "/" symtab, "//"
-			 * long-name table, ...) -- see this file's header on
-			 * why long names aren't read. Skip its data and move
-			 * on rather than failing the whole archive. */
+			/* Foreign special member (GNU "/" symtab, "//" long-name
+			 * table, ...); skip rather than fail the whole archive. */
 			(void)0;
 		} else {
 			rc = visit(ar, &m, data_off, ctx);
@@ -224,7 +248,7 @@ static int ar_foreach(const char *path, ar_visit_fn visit, void *ctx)
 		if (fseek(ar, data_off + skip, SEEK_SET) != 0) break;
 	}
 
-	fclose(ar);
+	(void)fclose(ar);
 	return rc;
 }
 
@@ -236,15 +260,22 @@ static int ar_foreach(const char *path, ar_visit_fn visit, void *ctx)
  * reused across multiple name_wanted() calls in the same run. */
 static const char *basename_of(const char *path)
 {
-	const char *slash = strrchr(path, '/');
+	const char *slash;
+	/* path is always an argv-derived operand string. */
+	unsafe_assume_string_terminated(path);
+	slash = strrchr(path, '/');
 	const char *bslash = strrchr(path, '\\');
 	if (bslash && (!slash || bslash > slash)) slash = bslash;
 	return slash ? slash + 1 : path;
 }
 
+/* name is always a struct ar_member's own name[] field, never NULL. */
+static int name_wanted(const char *name, char **files, int nfiles)
+	__attribute__((nonnull(1, 2)));
 static int name_wanted(const char *name, char **files, int nfiles)
 {
 	int i;
+	unsafe_assume_string_terminated(name);
 	if (nfiles == 0) return 1;
 	for (i = 0; i < nfiles; i++)
 		if (files[i] && strcmp(basename_of(files[i]), name) == 0) return 1;
@@ -255,6 +286,11 @@ static int name_wanted(const char *name, char **files, int nfiles)
 
 struct t_ctx { char **files; int nfiles; int verbose; int any; };
 
+/* m and ctxp are never NULL (ar_foreach() always passes &m and &ctx),
+ * but reached only through the ar_visit_fn function pointer, so the
+ * checker can't derive that by inlining -- must be asserted here. */
+static int t_visit(FILE *ar, const struct ar_member *m, long data_off, void *ctxp)
+	__attribute__((nonnull(2, 4)));
 static int t_visit(FILE *ar, const struct ar_member *m, long data_off, void *ctxp)
 {
 	struct t_ctx *ctx = ctxp;
@@ -278,6 +314,10 @@ static int t_visit(FILE *ar, const struct ar_member *m, long data_off, void *ctx
 
 struct p_ctx { char **files; int nfiles; int verbose; };
 
+/* m and ctxp are never NULL -- see t_visit()'s identical comment above for
+ * why (same ar_foreach()/ar_visit_fn shape). */
+static int p_visit(FILE *ar, const struct ar_member *m, long data_off, void *ctxp)
+	__attribute__((nonnull(2, 4)));
 static int p_visit(FILE *ar, const struct ar_member *m, long data_off, void *ctxp)
 {
 	struct p_ctx *ctx = ctxp;
@@ -292,6 +332,7 @@ static int p_visit(FILE *ar, const struct ar_member *m, long data_off, void *ctx
 		size_t want = remain < (long)sizeof buf ? (size_t)remain : sizeof buf;
 		size_t got = fread(buf, 1, want, ar);
 		if (got == 0) break;
+		unsafe_assume_readable_span(buf, got);
 		if (fwrite(buf, 1, got, stdout) != got) {
 			__util_diagf("ar: error writing to standard output: %s\n", strerror(errno));
 			return -1;
@@ -305,6 +346,10 @@ static int p_visit(FILE *ar, const struct ar_member *m, long data_off, void *ctx
 
 struct x_ctx { char **files; int nfiles; int verbose; int failed; };
 
+/* m and ctxp are never NULL -- see t_visit()'s identical comment above for
+ * why (same ar_foreach()/ar_visit_fn shape). */
+static int x_visit(FILE *ar, const struct ar_member *m, long data_off, void *ctxp)
+	__attribute__((nonnull(2, 4)));
 static int x_visit(FILE *ar, const struct ar_member *m, long data_off, void *ctxp)
 {
 	struct x_ctx *ctx = ctxp;
@@ -315,6 +360,7 @@ static int x_visit(FILE *ar, const struct ar_member *m, long data_off, void *ctx
 	if (!name_wanted(m->name, ctx->files, ctx->nfiles)) return 0;
 	if (fseek(ar, data_off, SEEK_SET) != 0) { ctx->failed = 1; return 0; }
 
+	unsafe_assume_string_terminated(m->name);
 	out = fopen(m->name, "wb");
 	if (!out) {
 		__util_diagf("ar: cannot create '%s': %s\n", m->name, strerror(errno));
@@ -326,6 +372,7 @@ static int x_visit(FILE *ar, const struct ar_member *m, long data_off, void *ctx
 		size_t want = remain < (long)sizeof buf ? (size_t)remain : sizeof buf;
 		size_t got = fread(buf, 1, want, ar);
 		if (got == 0) break;
+		unsafe_assume_readable_span(buf, got);
 		if (fwrite(buf, 1, got, out) != got) {
 			__util_diagf("ar: error writing '%s': %s\n", m->name, strerror(errno));
 			ctx->failed = 1;
@@ -333,8 +380,13 @@ static int x_visit(FILE *ar, const struct ar_member *m, long data_off, void *ctx
 		}
 		remain -= (long)got;
 	}
-	fclose(out);
-	chmod(m->name, (mode_t)(m->mode & 07777));
+	if (fclose(out) != 0) {
+		__util_diagf("ar: error writing '%s': %s\n", m->name, strerror(errno));
+		ctx->failed = 1;
+	} else if (chmod(m->name, (mode_t)(m->mode & 07777)) != 0) {
+		__util_diagf("ar: %s: chmod: %s\n", m->name, strerror(errno));
+		ctx->failed = 1;
+	}
 	/* "The modification time of each file extracted shall be set to
 	 * the time the file is extracted from the archive" -- i.e.
 	 * deliberately NOT m->mtime; no utime() call here. */
@@ -352,7 +404,9 @@ struct rewrite_member { struct ar_member m; long data_off; };
  * a fresh archive to a temp file and renames it over the original --
  * the only way to change an archive member's size in place without a
  * hole-punching filesystem this build does not assume. */
-static int read_all_headers(const char *path, struct rewrite_member **out, int *nout)
+static int read_all_headers(const char *path,
+                            struct rewrite_member **out withtok(heap_allocated),
+                            int *nout)
 {
 	FILE *ar;
 	char magic[AR_MAGIC_LEN];
@@ -363,7 +417,7 @@ static int read_all_headers(const char *path, struct rewrite_member **out, int *
 	if (!ar) { *out = NULL; *nout = 0; return -1; }
 	if (fread(magic, 1, AR_MAGIC_LEN, ar) != AR_MAGIC_LEN ||
 	    memcmp(magic, AR_MAGIC, AR_MAGIC_LEN) != 0) {
-		fclose(ar);
+		(void)fclose(ar);
 		*out = NULL; *nout = 0;
 		return -2;
 	}
@@ -373,15 +427,15 @@ static int read_all_headers(const char *path, struct rewrite_member **out, int *
 		long skip;
 		size_t got = fread(raw, 1, AR_HDR_LEN, ar);
 		if (got == 0) break;
-		if (got != AR_HDR_LEN || parse_header(raw, &rm.m) < 0) { fclose(ar); free(arr); *out = NULL; *nout = 0; return -3; }
+		if (got != AR_HDR_LEN || parse_header(raw, &rm.m) < 0) { (void)fclose(ar); free(arr); *out = NULL; *nout = 0; return -3; }
 		rm.data_off = ftell(ar);
 		if (rm.m.name[0] != 0) {
 			if (n == cap) {
 				size_t newcap;
 				struct rewrite_member *na;
-				if (!__util_array_capacity(cap, n, 1, 16, sizeof *arr, &newcap)) { fclose(ar); free(arr); return -4; }
+				if (!__util_array_capacity(cap, n, 1, 16, sizeof *arr, &newcap)) { (void)fclose(ar); free(arr); return -4; }
 				na = __util_reallocarray(arr, newcap, sizeof *arr);
-				if (!na) { fclose(ar); free(arr); return -4; }
+				if (!na) { (void)fclose(ar); free(arr); return -4; }
 				arr = na; cap = newcap;
 			}
 			arr[n++] = rm;
@@ -389,7 +443,7 @@ static int read_all_headers(const char *path, struct rewrite_member **out, int *
 		skip = rm.m.size + (rm.m.size & 1);
 		if (fseek(ar, rm.data_off + skip, SEEK_SET) != 0) break;
 	}
-	fclose(ar);
+	(void)fclose(ar);
 	*out = arr;
 	*nout = (int)n;
 	return 0;
@@ -403,7 +457,7 @@ static int copy_bytes(FILE *src, FILE *dst, long off, long len)
 		size_t want = len < (long)sizeof buf ? (size_t)len : sizeof buf;
 		size_t got = fread(buf, 1, want, src);
 		if (got == 0) return -1;
-		__ownership_readable_span(buf, got);
+		unsafe_assume_readable_span(buf, got);
 		if (fwrite(buf, 1, got, dst) != got) return -1;
 		len -= (long)got;
 	}
@@ -419,10 +473,12 @@ static int emit_member(FILE *out, const struct ar_member *m, FILE *src_ar, long 
 {
 	if (write_header(out, m) < 0) return -1;
 	if (path) {
-		FILE *in = fopen(path, "rb");
+		FILE *in;
+		unsafe_assume_string_terminated(path);
+		in = fopen(path, "rb");
 		if (!in) return -1;
-		if (copy_bytes(in, out, 0, m->size) < 0) { fclose(in); return -1; }
-		fclose(in);
+		if (copy_bytes(in, out, 0, m->size) < 0) { (void)fclose(in); return -1; }
+		(void)fclose(in);
 	} else {
 		if (copy_bytes(src_ar, out, off, m->size) < 0) return -1;
 	}
@@ -434,6 +490,7 @@ static int build_member(const char *filepath, struct ar_member *m)
 {
 	struct stat st;
 	const char *bn = basename_of(filepath);
+	unsafe_assume_string_terminated(bn);
 	if (strlen(bn) > AR_NAME_MAX) {
 		__util_diagf("ar: %s: member name longer than %d bytes -- not supported "
 		                "by this build's archive format (see src/util/ar.c's header)\n",
@@ -455,7 +512,11 @@ static int build_member(const char *filepath, struct ar_member *m)
 	return 0;
 }
 
-/* -d: delete named members. */
+/* -d: delete named members. files is never NULL: every real call site
+ * (__util_ar_main() below) passes argv+3, a valid pointer into argv's own
+ * storage regardless of nfiles' value. */
+static int do_delete(const char *archive, char **files, int nfiles, int verbose)
+	__attribute__((nonnull(2)));
 static int do_delete(const char *archive, char **files, int nfiles, int verbose)
 {
 	struct rewrite_member *arr;
@@ -472,10 +533,28 @@ static int do_delete(const char *archive, char **files, int nfiles, int verbose)
 	if (!src) { free(arr); __util_diagf("ar: %s: %s\n", archive, strerror(errno)); return 1; }
 
 	snprintf(tmppath, sizeof tmppath, "%s.artmp", archive);
+	unsafe_assume_string_terminated(tmppath);
 	tmp = fopen(tmppath, "wb");
-	if (!tmp) { fclose(src); free(arr); __util_diagf("ar: %s: %s\n", tmppath, strerror(errno)); return 1; }
+	if (!tmp) {
+		/* fclose(src) is cleanup for the fopen(tmppath) failure just
+		 * diagnosed; if it fails too, its own errno must not
+		 * overwrite the real reason tmppath could not be opened. */
+		int saved_errno = errno;
+		(void)fclose(src);
+		errno = saved_errno;
+		free(arr);
+		__util_diagf("ar: %s: %s\n", tmppath, strerror(errno));
+		return 1;
+	}
 	fwrite(AR_MAGIC, 1, AR_MAGIC_LEN, tmp);
 
+	/* read_all_headers() only ever sets *nout > 0 together with a
+	 * checked-nonnull *out (every element is stored into arr right after
+	 * a checked reallocarray(), the same 0-capacity-forces-first-growth
+	 * pattern as this project's other growable arrays) -- so n > i here
+	 * implies arr != NULL, a fact that does not survive that call's own
+	 * out-parameter return. */
+	if (n > 0) unsafe_assume_pointer_nonnull(arr);
 	for (i = 0; i < n; i++) {
 		if (name_wanted(arr[i].m.name, files, nfiles)) {
 			if (verbose) printf("d - %s\n", arr[i].m.name);
@@ -483,8 +562,12 @@ static int do_delete(const char *archive, char **files, int nfiles, int verbose)
 		}
 		emit_member(tmp, &arr[i].m, src, arr[i].data_off, NULL);
 	}
-	fclose(src);
-	fclose(tmp);
+	(void)fclose(src);
+	if (fclose(tmp) != 0) {
+		__util_diagf("ar: %s: %s\n", tmppath, strerror(errno));
+		free(arr);
+		return 1;
+	}
 	free(arr);
 	if (rename(tmppath, archive) != 0) {
 		__util_diagf("ar: cannot replace %s: %s\n", archive, strerror(errno));
@@ -493,7 +576,11 @@ static int do_delete(const char *archive, char **files, int nfiles, int verbose)
 	return 0;
 }
 
-/* -q/-r: append or replace-or-append. */
+/* -q/-r: append or replace-or-append. files is never NULL -- see
+ * do_delete()'s identical comment above for why. */
+static int do_append_or_replace(const char *archive, char **files, int nfiles,
+                                  int quick, int update, int suppress_diag, int verbose)
+	__attribute__((nonnull(2)));
 static int do_append_or_replace(const char *archive, char **files, int nfiles,
                                   int quick, int update, int suppress_diag, int verbose)
 {
@@ -518,6 +605,7 @@ static int do_append_or_replace(const char *archive, char **files, int nfiles,
 	if (!consumed) { free(arr); __util_diagf("ar: %s\n", strerror(ENOMEM)); return 1; }
 
 	snprintf(tmppath, sizeof tmppath, "%s.artmp", archive);
+	unsafe_assume_string_terminated(tmppath);
 	tmp = fopen(tmppath, "wb");
 	if (!tmp) {
 		free(arr); free(consumed);
@@ -537,6 +625,8 @@ static int do_append_or_replace(const char *archive, char **files, int nfiles,
 			if (!quick) {
 				for (fi = 0; fi < nfiles; fi++) {
 					const char *bn = basename_of(files[fi]);
+					unsafe_assume_string_terminated(bn);
+					unsafe_assume_string_terminated(arr[i].m.name);
 					if (strcmp(bn, arr[i].m.name) != 0) continue;
 					struct ar_member nm;
 					if (build_member(files[fi], &nm) < 0) { status = 1; consumed[fi] = 1; break; }
@@ -552,7 +642,7 @@ static int do_append_or_replace(const char *archive, char **files, int nfiles,
 				if (emit_member(tmp, &arr[i].m, src, arr[i].data_off, NULL) < 0) status = 1;
 			}
 		}
-		if (src) fclose(src);
+		if (src) (void)fclose(src);
 	}
 
 	for (i = 0; i < nfiles; i++) {
@@ -563,7 +653,12 @@ static int do_append_or_replace(const char *archive, char **files, int nfiles,
 		if (emit_member(tmp, &nm, NULL, 0, files[i]) < 0) status = 1;
 	}
 
-	fclose(tmp);
+	if (fclose(tmp) != 0) {
+		__util_diagf("ar: %s: %s\n", tmppath, strerror(errno));
+		free(arr);
+		free(consumed);
+		return 1;
+	}
 	free(arr);
 	free(consumed);
 	if (rename(tmppath, archive) != 0) {
@@ -573,7 +668,8 @@ static int do_append_or_replace(const char *archive, char **files, int nfiles,
 	return status;
 }
 
-int __util_ar_main(int argc, char **argv)
+int __util_ar_main(
+	int argc, char **argv elements_withtok(null_terminated, argc))
 {
 	char op = 0;
 	int cflag = 0, uflag = 0, vflag = 0;

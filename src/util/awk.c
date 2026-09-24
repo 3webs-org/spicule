@@ -114,6 +114,7 @@
 #include <errno.h>
 #include "awk_priv.h"
 #include "util.h"
+#include "ownership_stubs.h" /* unsafe_assume_string_terminated(), unsafe_assume_pointer_nonnull() */
 
 struct vassign { char *name, *val; };
 
@@ -127,21 +128,29 @@ static int awk_fatal_armed;
 void awk_unwind_fatal(void)
 {
 	if (awk_fatal_armed) longjmp(awk_fatal_env, 1);
-	/* No __util_awk_main() call is on the stack to catch this (e.g. a
-	 * direct awk_parse_program() call, the way fuzz/fuzz_awk.c's own
-	 * harness makes one to pre-check a program before deciding whether
-	 * to run it) -- see awk_priv.h's own comment on awk_fatal_armed.
-	 * Falling back to the historical diagnostic-plus-exit(2) behavior
-	 * is still correct for that caller; only __util_awk_main() itself
-	 * needs (and gets) the non-exiting path. */
+	/* No __util_awk_main() is on the stack to catch this (e.g. a direct
+	 * awk_parse_program() call, as fuzz/fuzz_awk.c's harness makes) --
+	 * see awk_priv.h's comment on awk_fatal_armed. Falling back to
+	 * diagnostic-plus-exit(2) is still correct there; only
+	 * __util_awk_main() gets the non-exiting path. */
 	exit(2);
 }
 
-static void buf_grow_append(char **buf, size_t *len, size_t *cap, const char *s, size_t n)
+static void buf_grow_append(char **buf withtok(heap_allocated), size_t *len, size_t *cap, const char *s, size_t n)
 {
-	if (*len + n + 1 > *cap) {
-		size_t newcap = *cap ? *cap * 2 : 256;
-		while (newcap < *len + n + 1) newcap *= 2;
+	/* *len + n + 1, computed raw, wraps for an adversarial n (a huge
+	 * -f program file) and would then wrongly compare as "already
+	 * fits" against *cap -- same fix as this file's sibling
+	 * awk_run.c's buf_append(). */
+	size_t need;
+	if (!__util_size_add(*len, n, &need) || !__util_size_add(need, 1, &need)) {
+		__util_diagf("awk: out of memory\n"); awk_unwind_fatal();
+	}
+	if (need > *cap) {
+		size_t newcap = *cap ? *cap : 256;
+		while (newcap < need) {
+			if (!__util_size_mul(newcap, 2, &newcap)) { __util_diagf("awk: out of memory\n"); awk_unwind_fatal(); }
+		}
 		*buf = realloc(*buf, newcap);
 		if (!*buf) { __util_diagf("awk: out of memory\n"); awk_unwind_fatal(); }
 		*cap = newcap;
@@ -151,25 +160,49 @@ static void buf_grow_append(char **buf, size_t *len, size_t *cap, const char *s,
 	(*buf)[*len] = 0;
 }
 
-static char *load_progfiles(char **files, int nfiles)
+withtok(heap_allocated)
+static char *load_progfiles(char **files elements_withtok(null_terminated, nfiles), int nfiles)
 {
 	char *buf = NULL;
 	size_t len = 0, cap = 0;
 	int i;
 
 	for (i = 0; i < nfiles; i++) {
-		FILE *f = strcmp(files[i], "-") == 0 ? stdin : fopen(files[i], "r");
+		const char *fname = files[i];
+		/* use_stdin, not `f != stdin`, decides the fclose() below -- the
+		 * checker can't prove opaque pointers unequal, so a direct
+		 * comparison makes this fopen() allocation look conditionally
+		 * leaked (same idiom as src/util/join.c's read_all()). */
+		int use_stdin = strcmp(fname, "-") == 0;
+		FILE *f = use_stdin ? stdin : fopen(fname, "r");
 		char chunk[4096];
 		size_t n;
+
+		unsafe_assume_string_terminated(fname);
 		if (!f) {
-			__util_diagf("awk: %s: %s\n", files[i], strerror(errno));
+			__util_diagf("awk: %s: %s\n", fname, strerror(errno));
 			free(buf);
 			return NULL;
 		}
 		while ((n = fread(chunk, 1, sizeof chunk, f)) > 0)
 			buf_grow_append(&buf, &len, &cap, chunk, n);
-		if (f != stdin) fclose(f);
-		if (len == 0 || buf[len - 1] != '\n') buf_grow_append(&buf, &len, &cap, "\n", 1);
+		if (!use_stdin) (void)fclose(f);
+		if (len == 0) {
+			buf_grow_append(&buf, &len, &cap, "\n", 1);
+		} else {
+			/* len only grows inside buf_grow_append(), whose growth
+			 * branch always leaves *buf non-null before *len advances --
+			 * a cross-call invariant this checker can't derive on its
+			 * own. */
+			unsafe_assume_pointer_nonnull(buf);
+			/* ValidPointer still can't prove buf's extent covers index
+			 * len-1: the real extent buf_grow_append()'s realloc()
+			 * establishes doesn't survive back out through its char**
+			 * parameter. No annotation narrows extent state the way
+			 * unsafe_assume_pointer_nonnull() narrows nonnull state; left
+			 * open. */
+			if (buf[len - 1] != '\n') buf_grow_append(&buf, &len, &cap, "\n", 1);
+		}
 	}
 	if (!buf) buf = strdup("");
 	return buf;
@@ -193,16 +226,15 @@ static int split_assignment(char *s, char **name_out, char **val_out)
 	return 1;
 }
 
-/* -F/-v/-f all share the standard getopt(3)-style rule that an option's
- * argument is either attached (`-Fx`) or, when nothing is attached, the
- * next argv element (`-F x`). Returns that argument text, advancing
- * *argi past it in the "next argv element" case; on the missing-
- * argument case prints the diagnostic itself and returns NULL, which
- * the caller must treat as "return 2" (this function cannot do that
- * unwind itself: it runs before __util_awk_main()'s own setjmp() is
- * armed, so a plain return here is already exactly what every other
- * error in this same option loop does). */
-static const char *opt_value(char **argv, int argc, int *argi, char opt, const char *arg)
+/* -F/-v/-f share the getopt(3)-style rule that an option's argument is
+ * either attached (`-Fx`) or the next argv element (`-F x`). Returns
+ * that text, advancing *argi in the "next element" case; on a missing
+ * argument, prints the diagnostic and returns NULL, which the caller
+ * must treat as "return 2" (this function can't unwind itself: it runs
+ * before __util_awk_main()'s setjmp() is armed). */
+withtok(null_terminated)
+static const char *opt_value(char **argv elements_withtok(null_terminated, argc),
+	int argc, int *argi, char opt, const char *arg withtok(null_terminated))
 {
 	if (arg[2]) return arg + 2;
 	if (++*argi >= argc) {
@@ -212,9 +244,16 @@ static const char *opt_value(char **argv, int argc, int *argi, char opt, const c
 	return argv[*argi];
 }
 
-int __util_awk_main(int argc, char **argv)
+int __util_awk_main(
+	int argc, char **argv elements_withtok(null_terminated, argc))
 {
 	const char *fsarg = NULL;
+	/* vassigns/progfiles and each -v's strdup() are freed once applied
+	 * below, but only on the path that reaches that point -- every
+	 * early usage-error return leaves them unfreed.
+	 * spicule.AllocationLifetime flags those returns; left open rather
+	 * than threading cleanup through every CLI usage error, same
+	 * rationale as this file's tail comment on the parsed program. */
 	struct vassign *vassigns = NULL;
 	int nvassigns = 0;
 	char **progfiles = NULL;
@@ -230,6 +269,7 @@ int __util_awk_main(int argc, char **argv)
 		char *arg = argv[i];
 		const char *val;
 
+		unsafe_assume_string_terminated(arg);
 		if (!strcmp(arg, "--")) { i++; break; }
 		if (arg[0] != '-' || arg[1] == 0) break;
 
@@ -244,6 +284,7 @@ int __util_awk_main(int argc, char **argv)
 			char *dup;
 			val = opt_value(argv, argc, &i, 'v', arg);
 			if (!val) return 2;
+			unsafe_assume_string_terminated(val);
 			dup = strdup(val);
 			if (!dup) { __util_diagf("awk: out of memory\n"); return 2; }
 			if (!split_assignment(dup, &name, &v2)) {
@@ -252,7 +293,7 @@ int __util_awk_main(int argc, char **argv)
 				return 2;
 			}
 			{
-				struct vassign *g = realloc(vassigns, (size_t)(nvassigns + 1) * sizeof *g);
+				struct vassign *g = __util_reallocarray(vassigns, (size_t)nvassigns + 1, sizeof *g);
 				if (!g) { __util_diagf("awk: out of memory\n"); return 2; }
 				vassigns = g;
 				vassigns[nvassigns].name = name;
@@ -265,7 +306,7 @@ int __util_awk_main(int argc, char **argv)
 			val = opt_value(argv, argc, &i, 'f', arg);
 			if (!val) return 2;
 			{
-				char **g = realloc(progfiles, (size_t)(nprogfiles + 1) * sizeof *g);
+				char **g = __util_reallocarray(progfiles, (size_t)nprogfiles + 1, sizeof *g);
 				if (!g) { __util_diagf("awk: out of memory\n"); return 2; }
 				progfiles = g;
 				progfiles[nprogfiles++] = (char *)val;
@@ -279,14 +320,12 @@ int __util_awk_main(int argc, char **argv)
 	}
 
 	/* ---- fatal-error unwind: armed once here, covers every phase below
-	 * (loading -f progfiles, parsing, running) without separate per-
-	 * phase machinery -- see awk_priv.h's own long comment on
-	 * awk_fatal_env/awk_unwind_fatal() for the full design, including
-	 * why the catching branch below deliberately touches nothing but
-	 * awk_fatal_armed and a hardcoded status (ip/prog/progtext are
-	 * ordinary, non-volatile locals modified after this setjmp(), so
-	 * touching them from here would itself be undefined behavior --
-	 * see that same comment's point 3). */
+	 * (loading -f progfiles, parsing, running) without per-phase
+	 * machinery -- see awk_priv.h's comment on awk_fatal_env/
+	 * awk_unwind_fatal() for the full design. The catching branch below
+	 * deliberately touches nothing but awk_fatal_armed and a hardcoded
+	 * status: ip/prog/progtext are ordinary non-volatile locals modified
+	 * after this setjmp(), so touching them here would itself be UB. */
 	if (setjmp(awk_fatal_env)) {
 		awk_fatal_armed = 0;
 		return 2;
@@ -295,6 +334,10 @@ int __util_awk_main(int argc, char **argv)
 
 	if (have_f) {
 		progtext = load_progfiles(progfiles, nprogfiles);
+		/* progfiles only ever borrows pointers into argv (see the -f
+		 * case below); the array itself is never needed again once
+		 * load_progfiles() has read every entry. */
+		free(progfiles);
 		if (!progtext) { awk_fatal_armed = 0; return 2; }
 	} else {
 		if (i >= argc) { __util_diagf("awk: missing program text\n"); awk_fatal_armed = 0; return 2; }
@@ -303,6 +346,12 @@ int __util_awk_main(int argc, char **argv)
 	}
 
 	prog = awk_parse_program(progtext);
+	/* progtext is heap-owned only in the -f path (load_progfiles()); the
+	 * bare-program-text path points it at argv[i], which must not be
+	 * freed. awk_parse_program() never retains src past its own return
+	 * (its lexer just walks it), so freeing here is safe regardless of
+	 * whether parsing succeeded. */
+	if (have_f) free(progtext);
 	if (!prog) { awk_fatal_armed = 0; return 2; }
 
 	awk_interp_init(&ip, prog);
@@ -310,24 +359,25 @@ int __util_awk_main(int argc, char **argv)
 	if (fsarg) awk_interp_set_str(&ip, "FS", fsarg);
 	{
 		int vi;
-		for (vi = 0; vi < nvassigns; vi++)
+		for (vi = 0; vi < nvassigns; vi++) {
 			awk_interp_set_str(&ip, vassigns[vi].name, vassigns[vi].val);
+			/* vassigns[vi].name is the strdup() from the -v case
+			 * below; .val just points partway into that same
+			 * block, so freeing .name alone is enough. */
+			free(vassigns[vi].name);
+		}
+		free(vassigns);
 	}
 	awk_interp_setup_argv(&ip, argv[0], argc - i, argv + i);
 
 	status = awk_interp_run(&ip);
 	awk_interp_free(&ip);
-	/* The parsed program (AST/lexer-owned strings/compiled literal
-	 * EREs) is deliberately never freed -- this is a short-lived CLI
-	 * process (or, as a shell built-in, one bi_awk() invocation), so
-	 * the OS reclaims it at exit either way; see this file's own
-	 * header for the same allocation-failure-handling philosophy
-	 * (fatal rather than threaded through every call site) applied
-	 * one step further, to a whole-of-run allocation nothing in this
-	 * tree's other utilities needs to free piecemeal either (compare
-	 * src/util/sort.c's own free_lines() -- sort frees because it may
-	 * run again in the same process's loop in principle; awk's own
-	 * program is parsed exactly once per process). */
+	/* The parsed program (AST/lexer-owned strings/compiled EREs) is
+	 * deliberately never freed -- a short-lived CLI process (or one
+	 * bi_awk() shell-builtin invocation), so the OS reclaims it at exit
+	 * either way. Compare src/util/sort.c's free_lines(), which frees
+	 * because it may run again in the same process's loop; awk's
+	 * program is parsed exactly once per process. */
 	awk_fatal_armed = 0;
 	return status;
 }

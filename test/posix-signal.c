@@ -11,13 +11,13 @@
  *
  * src/signal/signal.c's header comment is required reading before any of
  * this: signals are self-generated, synchronous CPU exceptions, timer APCs,
- * or packets handled by ntlibc's delivery thread.  Blocking interfaces use
+ * or packets handled by spicule's delivery thread.  Blocking interfaces use
  * those asynchronous sources without pretending an ordinary instruction can
  * be interrupted in place.
  */
 /* kill() and the sigaction()/sigemptyset()/sigprocmask() family are
  * feature-test gated in include/signal.h; same define most other
- * test/*.c already carry for the same reason (see test/posix-glob.c's
+ * tests in test/ already carry for the same reason (see test/posix-glob.c's
  * comment on this exact define). */
 #define _GNU_SOURCE
 #include "test-policy.h"
@@ -42,7 +42,7 @@ static int fails;
  * hardware fault to it, on purpose -- see the SIGSEGV/SIGFPE tests below
  * for why bridging one in would cost more than it buys here. Reused
  * verbatim from test/malloc.c / test/posix-alloc.c's ASan detection. */
-#if defined(_NTLIBC_NATIVE_BUILD) || defined(__SANITIZE_ADDRESS__) || \
+#if defined(_SPICULE_NATIVE_BUILD) || defined(__SANITIZE_ADDRESS__) || \
     (defined(__has_feature) && __has_feature(address_sanitizer))
 #define NATIVE_NO_FAULT_BRIDGE 1
 #endif
@@ -192,7 +192,7 @@ static void test_kill(void)
 	 * being exercised here. */
 }
 
-#if NTLIBC_TEST(PASS, posix_signal_kill_validates_sig_for_other_pid) /* Fixed: kill() now validates sig before selecting the target path.
+#if SPICULE_TEST(PASS, posix_signal_kill_validates_sig_for_other_pid) /* Fixed: kill() now validates sig before selecting the target path.
 	 * and terminates the target with the unvalidated value otherwise.
 	 * kill.html ERRORS, shall fail: "[EINVAL] The value of the sig
 	 * argument is an invalid or unsupported signal number."  And
@@ -391,6 +391,62 @@ static void test_sigsetops(void)
 	CHECK(sigismember(&s, _NSIG - 1) == 1);
 }
 
+/* sigorset(3) (glibc/BSD, not POSIX -- src/signal/signal.c's own
+ * comment: "sigorset() would do this in one call" describing the very
+ * loop it replaces): "the union of the sets ... is stored in dest".
+ * Checked directly, plus its two-sided special cases: ORing with an
+ * empty set is a no-op, and ORing with a full set gives a full set. */
+static void test_sigorset(void)
+{
+	sigset_t a, b, dest;
+
+	sigemptyset(&a);
+	sigemptyset(&b);
+	CHECK(sigaddset(&a, SIGTERM) == 0);
+	CHECK(sigaddset(&b, SIGINT) == 0);
+
+	sigemptyset(&dest);
+	CHECK(sigorset(&dest, &a, &b) == 0);
+	CHECK(sigismember(&dest, SIGTERM) == 1);
+	CHECK(sigismember(&dest, SIGINT) == 1);
+	CHECK(sigismember(&dest, SIGHUP) == 0);
+
+	/* union with an empty set changes nothing */
+	sigemptyset(&b);
+	sigemptyset(&dest);
+	CHECK(sigorset(&dest, &a, &b) == 0);
+	CHECK(sigismember(&dest, SIGTERM) == 1);
+	CHECK(sigismember(&dest, SIGINT) == 0);
+
+	/* union with a full set is full */
+	sigfillset(&b);
+	CHECK(sigorset(&dest, &a, &b) == 0);
+	CHECK(sigisemptyset(&dest) == 0);
+	CHECK(sigismember(&dest, _NSIG - 1) == 1);
+}
+
+/* <signal.h>: "SIGRTMAX A symbolic constant that expands to a positive
+ * integer, of type int, that is the highest number of a realtime
+ * signal" -- defined here (include/signal.h) as a call through
+ * __libc_current_sigrtmax(), the same indirection glibc itself uses so
+ * the value can be computed rather than hardcoded. Checked against
+ * SIGRTMIN and against sig_valid()'s own upper bound (_NSIG - 1, per
+ * sigismember() accepting it above), since those are the two facts a
+ * caller building an RT signal set actually relies on. */
+static void test_sigrtmax(void)
+{
+	CHECK(SIGRTMAX == __libc_current_sigrtmax());
+	CHECK(SIGRTMAX >= SIGRTMIN);
+	CHECK(SIGRTMAX == _NSIG - 1);
+
+	{
+		sigset_t s;
+		sigemptyset(&s);
+		CHECK(sigaddset(&s, SIGRTMAX) == 0);
+		CHECK(sigismember(&s, SIGRTMAX) == 1);
+	}
+}
+
 /* ================================================================== *
  * sigprocmask.html
  * ================================================================== */
@@ -447,7 +503,7 @@ static void test_sigprocmask(void)
  * from delivery ... and ... pending." Complements test/misc.c's "blocked
  * signal becomes pending" check by also confirming pending is empty
  * beforehand and cleared again after delivery. */
-#if NTLIBC_TEST(PASS, posix_signal_sigign_discards_pending) /* Setting a disposition to SIG_IGN discards an
+#if SPICULE_TEST(PASS, posix_signal_sigign_discards_pending) /* Setting a disposition to SIG_IGN discards an
 	 * already-pending signal.  sigaction.html DESCRIPTION: "Setting a
 	 * signal action to SIG_IGN for a signal that is pending shall cause
 	 * the pending signal to be discarded, whether or not it is
@@ -1213,11 +1269,11 @@ static void test_fault_sigill_code(const char *self)
 #endif
 }
 
-#if NTLIBC_TEST(NA, posix_signal_fault_sigbus) /* N/A: signal.h.html basedefs / sigaction.html default-disposition
+#if SPICULE_TEST(NA, posix_signal_fault_sigbus) /* N/A: signal.h.html basedefs / sigaction.html default-disposition
  * table: SIGBUS's default action is to terminate the process, mapped
  * here from EXCEPTION_DATATYPE_MISALIGNMENT (src/signal/signal.c:
  * exception_handler() -- the switch case exists and IS wired to
- * SIGBUS). The gap is not in ntlibc: on x86 and x86_64, an unaligned
+ * SIGBUS). The gap is not in spicule: on x86 and x86_64, an unaligned
  * scalar load/store simply does not fault in user mode by default --
  * the CPU only raises #AC (-> EXCEPTION_DATATYPE_MISALIGNMENT) when
  * EFLAGS.AC is set *and* CPL==3, and no supported CRT/OS in this
@@ -1231,7 +1287,7 @@ static void test_fault_sigill_code(const char *self)
  * DATATYPE_MISALIGNMENT). So: the mapping this library provides is
  * real and implemented, but nothing a test can portably execute
  * reaches it -- there is no conformant way to provoke this exact
- * fault, which is what N/A here is about, not "ntlibc doesn't support
+ * fault, which is what N/A here is about, not "spicule doesn't support
  * it".
  *
  * EXPIRY, stated because this fence is conditional on TWO facts and
@@ -1242,7 +1298,7 @@ static void test_fault_sigill_code(const char *self)
  * configuration rather than by an opt-in flag -- AArch64 with SCTLR_EL1.A
  * set is the obvious case -- provoking the fault becomes ordinary
  * portable C, the clause becomes live, and this fence becomes false.
- * ntlibc is x86_64 and i386 only today (arch/); re-audit this the day a
+ * spicule is x86_64 and i386 only today (arch/); re-audit this the day a
  * third arch appears rather than assuming it carried over. */
 static void test_fault_sigbus(const char *self)
 {
@@ -1289,7 +1345,7 @@ static void test_strsignal(void)
 	(void)m;
 
 	/* psignal() (psignal.html, same page as psiginfo()) has no
-	 * implementation in ntlibc at all -- grep across src/ and include/
+	 * implementation in spicule at all -- grep across src/ and include/
 	 * finds no psignal symbol or prototype. There is nothing to test;
 	 * see the ledger fragment. */
 }
@@ -1418,7 +1474,7 @@ static void test_wait_encode_status(void)
 	}
 
 	/* WCOREDUMP (not a POSIX.1-2017 base macro -- see ledger fragment --
-	 * but ntlibc implements it): set for the traditional dumping
+	 * but spicule implements it): set for the traditional dumping
 	 * signals, clear otherwise. Unit-level version of what
 	 * test/waitpid-overflow.c already checks end-to-end through real
 	 * processes for SIGTERM/SIGABRT. */
@@ -1439,7 +1495,7 @@ static void test_wait_encode_status(void)
 }
 
 /* wait3()/wait4(): not a POSIX.1-2017 base function (wait3.html 404s on
- * the standard site; this is a BSD/historical interface). ntlibc
+ * the standard site; this is a BSD/historical interface). spicule
  * implements it as an extension (declared under _XOPEN_SOURCE ||
  * _GNU_SOURCE || _BSD_SOURCE in include/sys/wait.h), so it gets a
  * sanity pass rather than a clause audit: it reaps like waitpid() and
@@ -1475,7 +1531,7 @@ static void test_wait4_sanity(void)
  * signal number."
  *
  * killpg() and sigaltstack() both exist in src/signal/signal.c and link,
- * but were named by no assertion anywhere in test/*.c before this (see
+ * but were named by no assertion anywhere in the test/ tree before this (see
  * test/POSIX-GAP-ACCOUNTING.md's "implemented, but no assertion
  * anywhere" list).  These run on real Windows in CI too; neither
  * depends on Wine-specific behaviour. */
@@ -1495,7 +1551,7 @@ static void test_killpg(void)
 /* sigaltstack.html: "If ss is a null pointer, the current alternate
  * signal stack shall remain unchanged"; oss, when non-null, receives
  * the current state, whose ss_flags "shall contain SS_DISABLE" when no
- * alternate stack is currently established.  ntlibc establishes none
+ * alternate stack is currently established.  spicule establishes none
  * (there is no alternate-stack delivery on this platform, see this
  * file's banner), so SS_DISABLE is the permanent, correct answer --
  * asserted as such rather than as an aspiration. */
@@ -1520,7 +1576,7 @@ static void test_sigaltstack_disabled(void)
 
 /* sigset.html (XSI, obsolescent) and siginterrupt.html (XSI,
  * obsolescent) -- the five <signal.h> names test/POSIX-GAP-ACCOUNTING.md
- * lists as never asserted anywhere in test/*.c.
+ * lists as never asserted anywhere in the test/ tree.
  *
  * Pure library bookkeeping over this file's own signal-mask tables, so
  * Wine is a sound oracle for all of it; nothing here touches the
@@ -1719,7 +1775,7 @@ static void test_siginterrupt(void)
 	CHECK(siginterrupt(SIGINT, 1) == 0);
 
 	/* The effect siginterrupt() names -- clearing/setting SA_RESTART --
-	 * is N/A here and this file's header already says why: ntlibc never
+	 * is N/A here and this file's header already says why: spicule never
 	 * suspends a thread mid-call waiting on a signal, so there is no
 	 * restart-vs-EINTR decision for the flag to steer.  What is *not*
 	 * N/A is the argument check below. */
@@ -1767,7 +1823,7 @@ static void test_siginterrupt(void)
  * option group, so all 40 Code entries are mandatory.  What is asserted
  * is the property a handler depends on -- the codes for one signal are
  * distinct from each other, since si_code is compared for equality --
- * and NOT that ntlibc ever delivers any particular one: <signal.h>
+ * and NOT that spicule ever delivers any particular one: <signal.h>
  * records per code which NT exception status produces it and which
  * nothing does -- six of the eight ILL_* and two of the three BUS_* name
  * conditions NT never reports, and exist so a portable handler can name
@@ -1965,6 +2021,8 @@ int main(int argc, char **argv)
 	test_sa_resethand();
 	test_sigaction_implicit_mask();
 	test_sigsetops();
+	test_sigorset();
+	test_sigrtmax();
 	test_sigprocmask();
 	test_sigpending();
 	test_new_thread_pending_empty();

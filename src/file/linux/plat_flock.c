@@ -4,7 +4,7 @@
  * Linux implementation of src/internal/plat_flock.h -- see that header
  * for the contract each function makes, and src/mman/linux/plat_mem.c's
  * banner for the general discipline this file follows (raw syscall(2),
- * no host libc, -nostdinc against ntlibc's own headers, aarch64
+ * no host libc, -nostdinc against spicule's own headers, aarch64
  * syscall numbers confirmed against this host's own <sys/syscall.h> as
  * an oracle).
  *
@@ -22,14 +22,14 @@
  * around), Linux's flock(2) IS the exact whole-open-file-description
  * lock POSIX's flock() describes -- a single native syscall, no
  * emulation, no landmines to work around. LOCK_SH/LOCK_EX/LOCK_NB/
- * LOCK_UN are ntlibc's own <sys/file.h> values, unchanged: they already
+ * LOCK_UN are spicule's own <sys/file.h> values, unchanged: they already
  * match the Linux kernel ABI exactly (1/2/4/8, the same values every
  * Linux libc uses), so this needs no translation table either -- the
  * same "already matches the ABI" situation plat_mem.c's own banner
  * describes for PROT_/MAP_.
  */
 
-/* This translation unit implements ntlibc's freestanding -nostdinc
+/* This translation unit implements spicule's freestanding -nostdinc
  * public-header contract; transitive ABI declarations are intentional,
  * so hosted include ownership and unused-include advice do not apply. */
 // NOLINTBEGIN(misc-include-cleaner)
@@ -37,23 +37,34 @@
 #include <errno.h>
 #include "plat_flock.h"
 
-/* aarch64 Linux syscall number (arch/arm64/include/uapi/asm/unistd.h,
- * via the generic modern ABI's asm-generic/unistd.h) -- confirmed
- * against this host's own <sys/syscall.h> rather than assumed; see
- * plat_mem.c's banner for why this file cannot include that header
- * itself. */
+/* Linux syscall number -- aarch64 confirmed against this host's own
+ * <sys/syscall.h> (arch/arm64/include/uapi/asm/unistd.h, via the
+ * generic modern ABI's asm-generic/unistd.h); x86_64/i386 confirmed
+ * against this host's own /nix/store linux-headers asm/unistd_64.h /
+ * asm/unistd_32.h -- see plat_mem.c's banner for why this file cannot
+ * include that header itself. */
+#if defined(__aarch64__)
 #define SYS_flock 32
+#elif defined(__x86_64__)
+#define SYS_flock 73
+#elif defined(__i386__)
+#define SYS_flock 143
+#else
+#error "plat_flock.c: unsupported architecture (expected __aarch64__, __x86_64__ or __i386__)"
+#endif
 
-/* A minimal 6-argument raw syscall: `svc #0` directly, no host libc in
- * the call path at all -- NOT `extern long syscall(long, ...)`, which
- * is satisfied by the HOST's real glibc at link time in a non-
- * freestanding build and collapses every failure to exactly -1 with
- * glibc's OWN errno rather than the raw kernel -errno this file's
- * is_sys_error()/`errno = (int)-ret` translation requires -- see
- * src/mman/linux/plat_mem.c's fix for the fuller account, confirmed
- * independently across six other Linux backends.
- * aarch64's syscall calling convention: x8 = syscall number, x0..x5 =
- * up to 6 arguments, result (or -errno in [-4095,-1]) in x0. */
+/* A minimal 6-argument raw syscall: no host libc in the call path at
+ * all -- NOT `extern long syscall(long, ...)`, which is satisfied by
+ * the HOST's real glibc at link time in a non-freestanding build and
+ * collapses every failure to exactly -1 with glibc's OWN errno rather
+ * than the raw kernel -errno this file's is_sys_error()/
+ * `errno = (int)-ret` translation requires -- see src/mman/linux/
+ * plat_mem.c's fix for the fuller account, confirmed independently
+ * across six other Linux backends. Three per-arch bodies, same "own
+ * syscall table per file" discipline this tree already uses (see
+ * src/dirent/linux/plat_dirent.c's own raw_syscall()): aarch64's
+ * `svc #0`, x86_64's `syscall`, i386's register-starved `int $0x80`. */
+#if defined(__aarch64__)
 static long raw_syscall(long nr, long a1, long a2, long a3, long a4, long a5, long a6) // NOLINT(bugprone-easily-swappable-parameters) -- raw syscall ABI slots are positional and semantically distinct
 {
 	register long x8 __asm__("x8") = nr;
@@ -69,6 +80,47 @@ static long raw_syscall(long nr, long a1, long a2, long a3, long a4, long a5, lo
 		: "memory", "cc");
 	return x0;
 }
+#elif defined(__x86_64__)
+static long raw_syscall(long nr, long a1, long a2, long a3, long a4, long a5, long a6)
+{
+	long ret;
+	register long r10 __asm__("r10") = a4;
+	register long r8  __asm__("r8")  = a5;
+	register long r9  __asm__("r9")  = a6;
+	__asm__ volatile("syscall"
+	                 : "=a"(ret)
+	                 : "a"(nr), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
+	                 : "rcx", "r11", "memory");
+	return ret;
+}
+#elif defined(__i386__)
+static long raw_syscall(long nr, long a1, long a2, long a3, long a4, long a5, long a6)
+{
+	long args[7];
+	long ret;
+	args[0] = nr; args[1] = a1; args[2] = a2; args[3] = a3;
+	args[4] = a4; args[5] = a5; args[6] = a6;
+	__asm__ volatile(
+		"pushl %%ebp\n\t"
+		"pushl %%ebx\n\t"
+		"movl 4(%%eax), %%ebx\n\t"
+		"movl 8(%%eax), %%ecx\n\t"
+		"movl 12(%%eax), %%edx\n\t"
+		"movl 16(%%eax), %%esi\n\t"
+		"movl 20(%%eax), %%edi\n\t"
+		"movl 24(%%eax), %%ebp\n\t"
+		"movl (%%eax), %%eax\n\t"
+		"int $0x80\n\t"
+		"popl %%ebx\n\t"
+		"popl %%ebp"
+		: "=a"(ret)
+		: "a"(args)
+		: "ecx", "edx", "esi", "edi", "memory", "cc");
+	return ret;
+}
+#else
+#error "plat_flock.c: unsupported architecture (expected __aarch64__, __x86_64__ or __i386__)"
+#endif
 
 static int is_sys_error(long ret)
 {
